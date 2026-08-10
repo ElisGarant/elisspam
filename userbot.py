@@ -14,12 +14,14 @@ import binascii
 import logging
 import os
 import random
+import re
 import struct
+from datetime import datetime, timezone
 from typing import Awaitable, Callable
 import zlib
 
 import qrcode
-from telethon import TelegramClient, utils
+from telethon import TelegramClient, utils, events
 from telethon.errors import (
     ChannelInvalidError,
     ChannelParicipantMissingError,
@@ -42,8 +44,13 @@ logger = logging.getLogger("userbot")
 
 _clients: dict[int, TelegramClient] = {}
 _active_broadcast_stop_events: dict[int, asyncio.Event] = {}
+_active_broadcast_pause_events: dict[int, asyncio.Event] = {}
 _active_broadcast_lock = asyncio.Lock()
+_restricted_run_by_sender: dict[int, int] = {}
+_restriction_sender_for_run: dict[int, int] = {}
+_resume_run_locks: dict[int, asyncio.Lock] = {}
 _inline_bot_username: str | None = getattr(config, "INLINE_BOT_USERNAME", None)
+_keyword_handlers_registered: set[int] = set()
 ProgressCallback = Callable[[dict], Awaitable[None]]
 
 
@@ -118,6 +125,7 @@ async def connect_userbot():
                 f"Юзербот sender_id={sender_id} owner_id={account['owner_id']} авторизован: "
                 f"{me.first_name} (@{me.username})"
             )
+            _register_keyword_handler(client, sender_id, int(account["owner_id"]))
         else:
             logger.warning(
                 f"Юзербот sender_id={sender_id} owner_id={account['owner_id']} НЕ авторизован. "
@@ -143,6 +151,9 @@ async def refresh_sender_account_identity(sender_id: int):
     client = await _get_client(sender_id)
     me = await client.get_me()
     await db.update_sender_account_identity(sender_id, me)
+    account = await db.get_sender_account(int(sender_id), include_inactive=True)
+    if account:
+        _register_keyword_handler(client, int(sender_id), int(account["owner_id"]))
     return me
 
 
@@ -175,7 +186,7 @@ async def get_sender_accounts(
     authorized_only: bool = True,
 ) -> list[dict]:
     """
-    Возвращает авторизованные аккаунты-отправители.
+    Возвращает аккаунты-отправители и их последнее известное техническое состояние.
     sender_id здесь — id строки sender_accounts, к которой привязан файл сессии Telethon.
     """
     configured_accounts = await db.get_sender_accounts(
@@ -208,8 +219,163 @@ async def get_sender_accounts(
             "username": getattr(me, "username", None) if me else account.get("username"),
             "telegram_user_id": getattr(me, "id", None) if me else account.get("telegram_user_id"),
             "is_root_owner": db.is_root_admin(account["owner_id"]),
+            "health_status": account.get("health_status") or "unknown",
+            "health_error": account.get("health_error"),
+            "health_checked_at": account.get("health_checked_at"),
         })
     return accounts
+
+
+async def check_sender_account(sender_id: int) -> dict:
+    """
+    Проверяет сессию без тестовой рассылки: доступность клиента, авторизацию и get_me().
+    Ограничение на отправку (restricted) намеренно не снимается этой проверкой, потому что
+    безопасно определить его исчезновение без реальной отправки нельзя.
+    """
+    account = await db.get_sender_account(int(sender_id), include_inactive=False)
+    if not account:
+        return {"id": int(sender_id), "status": "technical_error", "authorized": False, "error": "Аккаунт не найден"}
+    try:
+        client = await _get_client(int(sender_id))
+        authorized = await client.is_user_authorized()
+        if not authorized:
+            error = "Сессия не авторизована"
+            await db.set_sender_account_health(int(sender_id), "unauthorized", error)
+            return {"id": int(sender_id), "status": "unauthorized", "authorized": False, "error": error}
+        me = await client.get_me()
+        if me:
+            await db.update_sender_account_identity(int(sender_id), me)
+        previous_status = account.get("health_status") or "unknown"
+        if previous_status == "restricted":
+            # get_me подтверждает работоспособность сессии, но не отсутствие ограничения на исходящие сообщения.
+            return {
+                "id": int(sender_id),
+                "status": "restricted",
+                "authorized": True,
+                "error": account.get("health_error") or "Ранее обнаружено ограничение отправки",
+            }
+        await db.set_sender_account_health(int(sender_id), "ok", None)
+        return {"id": int(sender_id), "status": "ok", "authorized": True, "error": None}
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        await db.set_sender_account_health(int(sender_id), "technical_error", error)
+        return {"id": int(sender_id), "status": "technical_error", "authorized": False, "error": error}
+
+
+async def check_sender_accounts(owner_id: int | None = None) -> list[dict]:
+    configured = await db.get_sender_accounts(owner_id=owner_id, include_inactive=False)
+    results = []
+    for account in configured:
+        result = await check_sender_account(int(account["id"]))
+        result["label"] = _format_sender_label(account)
+        results.append(result)
+    return results
+
+
+SPAMBOT_USERNAME = "SpamBot"
+_SPAMBOT_LIMIT_RE = re.compile(
+    r"(\d{1,2}\s+[A-Za-z]{3}\s+\d{4},\s+\d{1,2}:\d{2}\s+UTC)",
+    re.IGNORECASE,
+)
+
+
+def _parse_spambot_limit(text: str) -> datetime | None:
+    match = _SPAMBOT_LIMIT_RE.search(text or "")
+    if not match:
+        return None
+    try:
+        return datetime.strptime(match.group(1), "%d %b %Y, %H:%M UTC").replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _spambot_says_clear(text: str) -> bool:
+    low = (text or "").lower()
+    phrases = (
+        "никаких ограничений",
+        "ограничений на вашем аккаунте нет",
+        "no limits are currently applied",
+        "free from any restrictions",
+        "no restrictions are currently applied",
+    )
+    return any(phrase in low for phrase in phrases)
+
+
+async def _spambot_query_once(client: TelegramClient, timeout_seconds: int = 12) -> str | None:
+    entity = await client.get_entity(SPAMBOT_USERNAME)
+    before = await client.get_messages(entity, limit=1)
+    before_id = int(before[0].id) if before else 0
+    sent = await client.send_message(entity, "/start")
+    min_id = max(before_id, int(getattr(sent, "id", 0)))
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + max(3, int(timeout_seconds))
+    while loop.time() < deadline:
+        await asyncio.sleep(1)
+        messages = await client.get_messages(entity, limit=6)
+        for msg in messages:
+            if int(getattr(msg, "id", 0)) <= min_id or bool(getattr(msg, "out", False)):
+                continue
+            text = getattr(msg, "message", None) or ""
+            if text.strip():
+                return text
+    return None
+
+
+async def check_spambot_status(sender_id: int) -> dict:
+    """Проверяет официальный SpamBot. Повторный запрос делается только для уже истёкшей даты."""
+    sender_id = int(sender_id)
+    client = await _get_client(sender_id)
+    if not await client.is_user_authorized():
+        error = "Сессия не авторизована"
+        await db.set_sender_account_health(sender_id, "unauthorized", error)
+        return {"restricted": None, "until": None, "text": error}
+
+    text = await _spambot_query_once(client)
+    if not text:
+        return {"restricted": None, "until": None, "text": "SpamBot не ответил на запрос статуса"}
+
+    until = _parse_spambot_limit(text)
+    now = datetime.now(timezone.utc)
+    if until and until > now:
+        await db.set_sender_account_health(sender_id, "restricted", f"Ограничение до {until:%d.%m.%Y %H:%M UTC}")
+        return {"restricted": True, "until": until, "text": text}
+
+    if until and until <= now:
+        # Дата из ответа уже истекла: один раз обновляем статус, чтобы не полагаться на старое сообщение.
+        await asyncio.sleep(1.5)
+        refreshed = await _spambot_query_once(client)
+        if refreshed:
+            text = refreshed
+            until = _parse_spambot_limit(text)
+            now = datetime.now(timezone.utc)
+            if until and until > now:
+                await db.set_sender_account_health(sender_id, "restricted", f"Ограничение до {until:%d.%m.%Y %H:%M UTC}")
+                return {"restricted": True, "until": until, "text": text}
+
+    if _spambot_says_clear(text) or (until is not None and until <= datetime.now(timezone.utc)):
+        await db.set_sender_account_health(sender_id, "ok", None)
+        return {"restricted": False, "until": until, "text": text}
+
+    return {"restricted": None, "until": until, "text": text}
+
+
+async def get_restriction_run_for_sender(sender_id: int) -> int | None:
+    return _restricted_run_by_sender.get(int(sender_id))
+
+
+async def release_restriction_pause(run_id: int) -> list[int]:
+    """Снимает только внутреннюю паузу после отдельной успешной проверки статуса."""
+    run_id = int(run_id)
+    async with _active_broadcast_lock:
+        sender_ids = [sender_id for sender_id, value in _restricted_run_by_sender.items() if value == run_id]
+        for sender_id in sender_ids:
+            _restricted_run_by_sender.pop(sender_id, None)
+            pause_event = _active_broadcast_pause_events.get(sender_id)
+            if pause_event:
+                pause_event.clear()
+        _restriction_sender_for_run.pop(run_id, None)
+    await db.set_broadcast_run_running(run_id)
+    return sorted(sender_ids)
 
 
 async def get_active_broadcast_sender_ids() -> list[int]:
@@ -217,12 +383,47 @@ async def get_active_broadcast_sender_ids() -> list[int]:
         return sorted(_active_broadcast_stop_events.keys())
 
 
+async def get_paused_broadcast_sender_ids() -> list[int]:
+    async with _active_broadcast_lock:
+        return sorted(
+            sender_id
+            for sender_id, pause_event in _active_broadcast_pause_events.items()
+            if pause_event.is_set()
+        )
+
+
+async def request_broadcast_pause(sender_id: int | None = None) -> list[int]:
+    """Ставит активную рассылку на паузу, не теряя очередь."""
+    async with _active_broadcast_lock:
+        if sender_id is None:
+            sender_ids = list(_active_broadcast_pause_events.keys())
+        else:
+            sender_ids = [int(sender_id)] if int(sender_id) in _active_broadcast_pause_events else []
+        for active_sender_id in sender_ids:
+            _active_broadcast_pause_events[active_sender_id].set()
+        return sorted(sender_ids)
+
+
+async def request_broadcast_resume(sender_id: int | None = None) -> list[int]:
+    """Продолжает ранее поставленную на паузу рассылку с того же места."""
+    async with _active_broadcast_lock:
+        if sender_id is None:
+            sender_ids = list(_active_broadcast_pause_events.keys())
+        else:
+            sender_ids = [int(sender_id)] if int(sender_id) in _active_broadcast_pause_events else []
+        resumed = []
+        for active_sender_id in sender_ids:
+            if active_sender_id in _restricted_run_by_sender:
+                continue
+            pause_event = _active_broadcast_pause_events[active_sender_id]
+            if pause_event.is_set():
+                pause_event.clear()
+                resumed.append(active_sender_id)
+        return sorted(resumed)
+
+
 async def request_broadcast_stop(sender_id: int | None = None) -> list[int]:
-    """
-    Ставит флаг остановки активной рассылки.
-    Если sender_id=None, останавливает все активные рассылки.
-    Возвращает список аккаунтов, для которых флаг был выставлен.
-    """
+    """Внутренняя аварийная остановка. В обычном интерфейсе используется пауза/продолжение."""
     async with _active_broadcast_lock:
         if sender_id is None:
             sender_ids = list(_active_broadcast_stop_events.keys())
@@ -230,24 +431,33 @@ async def request_broadcast_stop(sender_id: int | None = None) -> list[int]:
             sender_ids = [int(sender_id)] if int(sender_id) in _active_broadcast_stop_events else []
         for active_sender_id in sender_ids:
             _active_broadcast_stop_events[active_sender_id].set()
+            pause_event = _active_broadcast_pause_events.get(active_sender_id)
+            if pause_event:
+                pause_event.clear()
         return sorted(sender_ids)
 
 
-async def _register_broadcast_sender_ids(sender_ids: list[int]) -> dict[int, asyncio.Event]:
+async def _register_broadcast_sender_ids(sender_ids: list[int]) -> tuple[dict[int, asyncio.Event], dict[int, asyncio.Event]]:
     async with _active_broadcast_lock:
         busy_sender_ids = [sender_id for sender_id in sender_ids if sender_id in _active_broadcast_stop_events]
         if busy_sender_ids:
             busy = ", ".join(str(sender_id) for sender_id in busy_sender_ids)
             raise ValueError(f"На аккаунтах уже идёт рассылка: {busy}")
-        events = {sender_id: asyncio.Event() for sender_id in sender_ids}
-        _active_broadcast_stop_events.update(events)
-        return events
+        stop_events = {sender_id: asyncio.Event() for sender_id in sender_ids}
+        pause_events = {sender_id: asyncio.Event() for sender_id in sender_ids}
+        _active_broadcast_stop_events.update(stop_events)
+        _active_broadcast_pause_events.update(pause_events)
+        return stop_events, pause_events
 
 
 async def _unregister_broadcast_sender_ids(sender_ids: list[int]):
     async with _active_broadcast_lock:
         for sender_id in sender_ids:
             _active_broadcast_stop_events.pop(sender_id, None)
+            _active_broadcast_pause_events.pop(sender_id, None)
+            run_id = _restricted_run_by_sender.pop(sender_id, None)
+            if run_id is not None and not any(value == run_id for value in _restricted_run_by_sender.values()):
+                _restriction_sender_for_run.pop(run_id, None)
 
 
 # ---------- Авторизация по номеру телефона ----------
@@ -651,12 +861,172 @@ async def _send_template_post_via_inline(client: TelegramClient, entity, post: d
         return False
 
 
-async def send_to_employee(
+
+async def add_keyword_watch(sender_id: int, chat_ref: str, keywords: list[str], template_id: int) -> dict:
+    """Добавляет чат для наблюдения. Авто-DM разрешён только после предыдущего входящего ЛС от пользователя."""
+    account = await db.get_sender_account(int(sender_id), include_inactive=False)
+    if not account:
+        raise ValueError("Аккаунт отправки не найден")
+    owner_id = db.get_current_owner_id()
+    if int(account["owner_id"]) != int(owner_id) and not db.is_root_admin(owner_id):
+        raise ValueError("Нет доступа к этому аккаунту")
+    if not await is_authorized(sender_id):
+        raise ValueError("Аккаунт не авторизован")
+    template = await db.get_template(int(template_id))
+    if not template:
+        raise ValueError("Шаблон не найден")
+    client = await _get_client(sender_id)
+    entity = await client.get_entity(_normalize_chat_ref(chat_ref))
+    chat_id = int(utils.get_peer_id(entity))
+    title = _entity_title(entity, str(chat_ref).strip())
+    watch_id = await db.add_monitored_chat(
+        int(sender_id), str(chat_ref).strip(), chat_id, title, keywords, int(template_id)
+    )
+    _register_keyword_handler(client, int(sender_id), int(account["owner_id"]))
+    return {"id": watch_id, "chat_id": chat_id, "title": title, "keywords": keywords, "template_id": int(template_id)}
+
+
+async def _has_prior_private_interaction(client: TelegramClient, user_entity) -> bool:
+    """Безопасный gate: автоответ в ЛС только если человек раньше сам писал этому аккаунту в ЛС."""
+    try:
+        messages = await client.get_messages(user_entity, limit=50)
+    except Exception:
+        return False
+    return any(not getattr(message, "out", False) for message in messages)
+
+
+async def _process_keyword_event(event, sender_id: int, owner_id: int):
+    token = db.set_current_owner_id(owner_id)
+    try:
+        if getattr(event, "out", False):
+            return
+        watches = await db.get_monitored_chats(sender_account_id=sender_id, enabled_only=True)
+        if not watches:
+            return
+        chat_id = int(getattr(event, "chat_id", 0) or 0)
+        matching_watches = [w for w in watches if int(w.get("chat_id") or 0) == chat_id]
+        if not matching_watches:
+            return
+        text = (getattr(event, "raw_text", None) or "").lower()
+        if not text:
+            return
+        author = await event.get_sender()
+        if not author or getattr(author, "bot", False):
+            return
+        author_id = getattr(author, "id", None)
+        author_username = getattr(author, "username", None)
+        if not author_id:
+            return
+        client = await _get_client(sender_id)
+        me = await client.get_me()
+        if int(author_id) == int(me.id):
+            return
+        chat = await event.get_chat()
+        chat_title = _entity_title(chat, str(chat_id))
+
+        for watch in matching_watches:
+            matched = next((kw for kw in watch.get("keywords_list", []) if kw.lower() in text), None)
+            if not matched:
+                continue
+
+            # Не отправляем повторно, даже если раньше писал другой аккаунт владельца.
+            if await db.has_delivery(telegram_id=int(author_id), username=author_username):
+                await db.add_keyword_hit(
+                    monitored_chat_id=watch["id"], sender_account_id=sender_id,
+                    chat_id=chat_id, chat_title=chat_title, message_id=getattr(event, "id", None),
+                    author_telegram_id=int(author_id), author_username=author_username,
+                    matched_keyword=matched, action="skipped_already_contacted",
+                    details="Пользователь уже есть в общем реестре отправок",
+                )
+                continue
+
+            # Не инициируем холодное ЛС: человек должен ранее сам написать аккаунту в приватном чате.
+            if not await _has_prior_private_interaction(client, author):
+                await db.add_keyword_hit(
+                    monitored_chat_id=watch["id"], sender_account_id=sender_id,
+                    chat_id=chat_id, chat_title=chat_title, message_id=getattr(event, "id", None),
+                    author_telegram_id=int(author_id), author_username=author_username,
+                    matched_keyword=matched, action="candidate_no_consent",
+                    details="Ключ найден, но авто-DM не отправлен: нет предыдущего входящего ЛС",
+                )
+                continue
+
+            template = await db.get_template(int(watch["template_id"]))
+            if not template:
+                continue
+            reserved = await db.reserve_delivery(
+                telegram_id=int(author_id), username=author_username,
+                full_name=" ".join(filter(None, [getattr(author, "first_name", None), getattr(author, "last_name", None)])) or None,
+                sender_account_id=sender_id, template_id=int(watch["template_id"]),
+                source_kind="keyword_watch", source_chat_id=chat_id, source_chat_title=chat_title,
+            )
+            if not reserved:
+                continue
+            employee = {
+                "telegram_id": int(author_id), "username": author_username,
+                "full_name": " ".join(filter(None, [getattr(author, "first_name", None), getattr(author, "last_name", None)])) or None,
+            }
+            ok, error = await send_to_employee(employee, template, sender_id=sender_id)
+            await db.finish_delivery(telegram_id=int(author_id), username=author_username, success=ok, error=error)
+            await db.add_keyword_hit(
+                monitored_chat_id=watch["id"], sender_account_id=sender_id,
+                chat_id=chat_id, chat_title=chat_title, message_id=getattr(event, "id", None),
+                author_telegram_id=int(author_id), author_username=author_username,
+                matched_keyword=matched, action="sent" if ok else "send_failed", details=error,
+            )
+            break
+    except Exception as e:
+        logger.exception("Ошибка обработчика ключевых слов sender_id=%s: %s", sender_id, e)
+    finally:
+        db.reset_current_owner_id(token)
+
+
+def _register_keyword_handler(client: TelegramClient, sender_id: int, owner_id: int):
+    if sender_id in _keyword_handlers_registered:
+        return
+
+    async def handler(event):
+        await _process_keyword_event(event, sender_id, owner_id)
+
+    client.add_event_handler(handler, events.NewMessage(incoming=True))
+    _keyword_handlers_registered.add(sender_id)
+
+
+def _classify_send_exception(exc: Exception) -> tuple[str, str]:
+    """Возвращает (kind, human_error), где kind: restriction/technical/recipient."""
+    if isinstance(exc, FloodWaitError):
+        return "restriction", f"FloodWait: нужно подождать {exc.seconds} сек."
+    if isinstance(exc, PeerFloodError):
+        return "restriction", "Telegram временно ограничил отправку сообщений (PeerFlood)"
+    if isinstance(exc, UserPrivacyRestrictedError):
+        return "recipient", "Настройки приватности пользователя запрещают писать первым"
+    if isinstance(exc, (OSError, ConnectionError, asyncio.TimeoutError)):
+        return "technical", f"{type(exc).__name__}: {exc}"
+
+    name = type(exc).__name__
+    technical_names = {
+        "AuthKeyError", "AuthKeyDuplicatedError", "AuthKeyUnregisteredError",
+        "SessionExpiredError", "SessionRevokedError", "UnauthorizedError",
+        "UserDeactivatedError", "UserDeactivatedBanError", "ServerError",
+        "TimedOutError", "RpcCallFailError",
+    }
+    restriction_names = {
+        "UserRestrictedError", "UserBannedInChannelError", "ChatWriteForbiddenError",
+    }
+    if name in technical_names:
+        return "technical", f"{name}: {exc}"
+    if name in restriction_names:
+        return "restriction", f"{name}: {exc}"
+    return "recipient", str(exc)
+
+
+async def send_to_employee_detailed(
     employee: dict,
     template: dict | str,
     sender_id: int | None = None,
-) -> tuple[bool, str | None]:
-    """Отправляет один шаблон. Возвращает (успех, текст_ошибки)."""
+) -> tuple[bool, str | None, str | None]:
+    """Отправляет один шаблон и возвращает (успех, ошибка, тип_ошибки)."""
+    posts_sent = 0
     try:
         client = await _get_client(sender_id)
         target = await resolve_target(employee)
@@ -671,27 +1041,73 @@ async def send_to_employee(
                 sent_inline = await _send_template_post_via_inline(client, entity, post)
             if not sent_inline:
                 await _send_template_post(client, entity, post, can_send_buttons)
+            posts_sent += 1
             if post_delay_seconds and index < len(posts) - 1:
                 await asyncio.sleep(post_delay_seconds)
-        return True, None
-    except FloodWaitError as e:
-        return False, f"FloodWait: нужно подождать {e.seconds} сек."
-    except UserPrivacyRestrictedError:
-        return False, "Настройки приватности пользователя запрещают писать первым"
-    except PeerFloodError:
-        return False, "Telegram временно ограничил отправку сообщений (PeerFlood)"
-    except Exception as e:
-        return False, str(e)
+        if sender_id is not None:
+            account = await db.get_sender_account(int(sender_id), include_inactive=True)
+            if account and (account.get("health_status") or "unknown") != "ok":
+                await db.set_sender_account_health(int(sender_id), "ok", None)
+        return True, None, None
+    except Exception as exc:
+        kind, error = _classify_send_exception(exc)
+        if kind == "technical" and posts_sent:
+            kind = "technical_partial"
+            error = (
+                f"Технический сбой после отправки части шаблона ({posts_sent} сообщ.). "
+                f"Автоповтор отключён во избежание дубля. {error}"
+            )
+        if sender_id is not None:
+            if kind in {"technical", "technical_partial"}:
+                await db.set_sender_account_health(int(sender_id), "technical_error", error)
+            elif kind == "restriction":
+                await db.set_sender_account_health(int(sender_id), "restricted", error)
+        return False, error, kind
 
 
-async def _sleep_or_stopped(delay_seconds: float, stop_event: asyncio.Event) -> bool:
-    if delay_seconds <= 0:
-        return stop_event.is_set()
-    try:
-        await asyncio.wait_for(stop_event.wait(), timeout=delay_seconds)
+async def send_to_employee(
+    employee: dict,
+    template: dict | str,
+    sender_id: int | None = None,
+) -> tuple[bool, str | None]:
+    """Совместимый интерфейс для одиночной отправки."""
+    ok, error, _kind = await send_to_employee_detailed(employee, template, sender_id=sender_id)
+    return ok, error
+
+
+async def _wait_while_paused(stop_event: asyncio.Event, pause_event: asyncio.Event) -> bool:
+    while pause_event.is_set():
+        if stop_event.is_set():
+            return True
+        await asyncio.sleep(0.5)
+    return stop_event.is_set()
+
+
+async def _sleep_with_controls(
+    delay_seconds: float,
+    stop_event: asyncio.Event,
+    pause_event: asyncio.Event,
+) -> bool:
+    """Ждёт задержку, не расходуя её во время паузы. True = аварийная остановка."""
+    if await _wait_while_paused(stop_event, pause_event):
         return True
-    except asyncio.TimeoutError:
-        return stop_event.is_set()
+    remaining = max(0.0, float(delay_seconds))
+    loop = asyncio.get_running_loop()
+    while remaining > 0:
+        if stop_event.is_set():
+            return True
+        if pause_event.is_set():
+            if await _wait_while_paused(stop_event, pause_event):
+                return True
+            continue
+        slice_seconds = min(0.5, remaining)
+        started = loop.time()
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=slice_seconds)
+            return True
+        except asyncio.TimeoutError:
+            remaining -= max(0.0, loop.time() - started)
+    return stop_event.is_set()
 
 
 async def _get_broadcast_templates(template_id: int | None) -> tuple[list[dict], bool]:
@@ -728,14 +1144,16 @@ async def broadcast(
     sender_account_ids: list[int] | None = None,
     sender_owner_ids: list[int] | None = None,
     skip_existing_chat: str | None = None,
+    group_name: str | None = None,
 ) -> dict:
     """
     Рассылает шаблон списку пользователей с задержкой между отправками.
-    Если передано несколько sender_account_ids, отправляет параллельно с этих аккаунтов.
-    Если template_id=0/None, ротирует все доступные шаблоны.
-    skip_existing_chat задаёт чат, где найденных получателей нужно пропускать.
-    Возвращает статистику {'sent': N, 'failed': N, 'skipped': N, 'templates_used': N, 'stopped': bool}.
-    progress_callback вызывается после каждой попытки отправки.
+
+    При технической недоступности сессии (разлогин, обрыв соединения, сбой ключа
+    авторизации и т.п.) оставшаяся очередь этого аккаунта может быть автоматически
+    переназначена на другой выбранный исправный аккаунт. Ограничения Telegram на
+    отправку (PeerFlood/FloodWait/restricted) НЕ считаются техническим failover:
+    при них вся рассылка ставится на паузу.
     """
     data_owner_id = db.get_current_owner_id()
     if data_owner_id is None:
@@ -784,6 +1202,7 @@ async def broadcast(
     for sender_id in sender_account_ids:
         if not await is_authorized(sender_id):
             unauthorized_sender_ids.append(sender_id)
+            await db.set_sender_account_health(sender_id, "unauthorized", "Сессия не авторизована")
     if unauthorized_sender_ids:
         senders = ", ".join(f"#{sender_id}" for sender_id in unauthorized_sender_ids)
         raise ValueError(f"Юзербот не авторизован для аккаунтов: {senders}")
@@ -791,19 +1210,34 @@ async def broadcast(
     total = len(employees)
     templates, rotation_enabled = await _get_broadcast_templates(template_id)
     delay_min, delay_max = await get_delay_range()
+    auto_switch_raw = await db.get_setting("auto_switch_technical_accounts", "1")
+    auto_switch_technical = str(auto_switch_raw).strip().lower() not in {"0", "false", "off", "no"}
 
     sent, failed, skipped = 0, 0, 0
     processed = 0
     used_template_ids = set()
     previous_template_id = None
-    stopped_sender_ids = set()
-    jobs_by_sender = {sender_id: [] for sender_id in sender_account_ids}
+    stopped_sender_ids: set[int] = set()
+    technical_disabled_sender_ids: set[int] = set()
+    failover_jobs: list[dict] = []
+    failover_count = 0
+    failover_lock = asyncio.Lock()
 
+    jobs_by_sender: dict[int, list[dict]] = {sender_id: [] for sender_id in sender_account_ids}
+    all_jobs: list[dict] = []
     for index, employee in enumerate(employees):
         template = _next_template(templates, index, previous_template_id) if rotation_enabled else templates[0]
         previous_template_id = template["id"]
         sender_id = sender_account_ids[index % len(sender_account_ids)]
-        jobs_by_sender[sender_id].append((employee, template))
+        job = {
+            "employee": employee,
+            "template": template,
+            "position": index,
+            "sender_id": sender_id,
+            "attempted_sender_ids": set(),
+        }
+        jobs_by_sender[sender_id].append(job)
+        all_jobs.append(job)
 
     effective_sender_ids = [
         sender_id
@@ -818,6 +1252,9 @@ async def broadcast(
             "templates_used": 0,
             "stopped": False,
             "stopped_accounts": [],
+            "technical_disabled_accounts": [],
+            "failover_count": 0,
+            "auto_switch_technical": auto_switch_technical,
             "senders_used": 0,
         }
 
@@ -834,7 +1271,13 @@ async def broadcast(
                 sender_id,
             )
 
-    stop_events = await _register_broadcast_sender_ids(effective_sender_ids)
+    stop_events, pause_events = await _register_broadcast_sender_ids(effective_sender_ids)
+    run_id = await db.create_broadcast_run(
+        template_id, group_name, total,
+        selected_account_ids=effective_sender_ids,
+        skip_existing_chat=skip_existing_chat,
+    )
+    await db.initialize_broadcast_run_items(run_id, all_jobs)
     progress_lock = asyncio.Lock()
 
     async def report_progress(
@@ -855,8 +1298,9 @@ async def broadcast(
             else:
                 failed += 1
                 logger.warning(
-                    "Не удалось отправить пользователю "
-                    f"{employee.get('username') or employee.get('telegram_id')}: {error}"
+                    "Не удалось отправить пользователю %s: %s",
+                    employee.get("username") or employee.get("telegram_id"),
+                    error,
                 )
             if progress_callback:
                 await progress_callback({
@@ -874,76 +1318,404 @@ async def broadcast(
                     "sender_account_id": sender_id,
                     "sender_owner_id": int(configured_by_id[sender_id]["owner_id"]),
                     "stopped_accounts": sorted(stopped_sender_ids),
+                    "paused_accounts": sorted(
+                        active_sender_id
+                        for active_sender_id, pause_event in pause_events.items()
+                        if pause_event.is_set()
+                    ),
+                    "technical_disabled_accounts": sorted(technical_disabled_sender_ids),
+                    "failover_count": failover_count,
+                    "auto_switch_technical": auto_switch_technical,
+                    "run_id": run_id,
                     "skip_chat_title": skip_chat_title,
                 })
 
-    async def run_sender(sender_id: int, jobs: list[tuple[dict, dict]]):
+    async def record_final(
+        sender_id: int,
+        job: dict,
+        status: str,
+        error: str | None,
+    ):
+        employee = job["employee"]
+        template = job["template"]
+        await db.add_log(employee.get("id"), template["id"], status, error)
+        await db.update_broadcast_run_item(
+            run_id, int(job["position"]), sender_account_id=sender_id, status=status, error=error
+        )
+        await db.refresh_broadcast_run_stats(run_id)
+        await report_progress(sender_id, employee, template, status, error)
+
+    async def process_job(sender_id: int, job: dict) -> tuple[str, str | None, str | None]:
+        employee = job["employee"]
+        template = job["template"]
+        status = "failed"
+        error = None
+        error_kind = None
+
+        if await db.has_delivery(employee.get("telegram_id"), employee.get("username")):
+            return "skipped", "Уже было отправлено с одного из аккаунтов", None
+
+        if skip_existing_chat:
+            in_chat, check_error = await _is_employee_in_chat(
+                employee,
+                skip_chat_entities[sender_id],
+                sender_id,
+            )
+            if check_error:
+                return "failed", check_error, None
+            if in_chat:
+                return "skipped", f"Уже есть в чате: {skip_chat_title or skip_existing_chat}", None
+
+        reserved = await db.reserve_delivery(
+            telegram_id=employee.get("telegram_id"),
+            username=employee.get("username"),
+            full_name=employee.get("full_name"),
+            sender_account_id=sender_id,
+            template_id=template.get("id"),
+            source_kind="broadcast",
+        )
+        if not reserved:
+            return "skipped", "Уже было отправлено/зарезервировано другим аккаунтом", None
+
+        ok, error, error_kind = await send_to_employee_detailed(
+            employee,
+            template,
+            sender_id=sender_id,
+        )
+        await db.finish_delivery(
+            telegram_id=employee.get("telegram_id"),
+            username=employee.get("username"),
+            success=ok,
+            error=error,
+        )
+        status = "sent" if ok else "failed"
+        return status, error, error_kind
+
+    async def queue_for_failover(sender_id: int, jobs: list[dict], start_index: int):
+        nonlocal failover_count
+        async with failover_lock:
+            for job in jobs[start_index:]:
+                moved = {
+                    "employee": job["employee"],
+                    "template": job["template"],
+                    "position": job["position"],
+                    "sender_id": job.get("sender_id", sender_id),
+                    "attempted_sender_ids": set(job.get("attempted_sender_ids") or set()) | {sender_id},
+                }
+                failover_jobs.append(moved)
+                failover_count += 1
+
+    async def mark_remaining_failed(sender_id: int, jobs: list[dict], start_index: int, reason: str):
+        for job in jobs[start_index:]:
+            await record_final(sender_id, job, "failed", reason)
+
+    async def run_sender(sender_id: int, jobs: list[dict]):
         stop_event = stop_events[sender_id]
+        pause_event = pause_events[sender_id]
         token = db.set_current_owner_id(data_owner_id)
+        index = 0
         try:
-            for index, (employee, template) in enumerate(jobs):
-                if stop_event.is_set():
+            while index < len(jobs):
+                if await _wait_while_paused(stop_event, pause_event):
                     stopped_sender_ids.add(sender_id)
                     break
 
-                status = "failed"
-                error = None
-                if skip_existing_chat:
-                    in_chat, check_error = await _is_employee_in_chat(
-                        employee,
-                        skip_chat_entities[sender_id],
-                        sender_id,
+                job = jobs[index]
+                employee = job["employee"]
+                template = job["template"]
+                await db.update_broadcast_run_item(
+                    run_id, int(job["position"]), sender_account_id=sender_id, status="sending", error=None
+                )
+                status, error, error_kind = await process_job(sender_id, job)
+
+                if status == "failed" and error_kind == "technical":
+                    await db.update_broadcast_run_item(
+                        run_id, int(job["position"]), sender_account_id=sender_id, status="pending", error=error
                     )
-                    if check_error:
-                        error = check_error
-                    elif in_chat:
-                        status = "skipped"
-                        error = f"Уже есть в чате: {skip_chat_title or skip_existing_chat}"
+                    technical_disabled_sender_ids.add(sender_id)
+                    if auto_switch_technical:
+                        await queue_for_failover(sender_id, jobs, index)
                     else:
-                        ok, error = await send_to_employee(
-                            employee,
-                            template,
-                            sender_id=sender_id,
+                        await record_final(sender_id, job, status, error)
+                        await mark_remaining_failed(
+                            sender_id,
+                            jobs,
+                            index + 1,
+                            "Аккаунт технически недоступен; автопереключение выключено",
                         )
-                        status = "sent" if ok else "failed"
-                else:
-                    ok, error = await send_to_employee(
-                        employee,
-                        template,
-                        sender_id=sender_id,
+                    break
+
+                if status == "failed" and error_kind == "restriction":
+                    # Ограниченный получатель остаётся pending и будет повторён после успешной проверки.
+                    await db.update_broadcast_run_item(
+                        run_id, int(job["position"]), sender_account_id=sender_id, status="pending", error=error
                     )
-                    status = "sent" if ok else "failed"
+                    await db.set_broadcast_run_paused(run_id, f"restriction:{error or 'restriction'}", sender_id)
+                    async with _active_broadcast_lock:
+                        _restriction_sender_for_run[run_id] = sender_id
+                        for active_sender_id in effective_sender_ids:
+                            _restricted_run_by_sender[active_sender_id] = run_id
+                    for active_pause_event in pause_events.values():
+                        active_pause_event.set()
+                    if progress_callback:
+                        await progress_callback({
+                            "total": total,
+                            "processed": processed,
+                            "sent": sent,
+                            "failed": failed,
+                            "skipped": skipped,
+                            "templates_used": len(used_template_ids),
+                            "current": employee,
+                            "ok": False,
+                            "status": "paused_restriction",
+                            "error": error,
+                            "sender_id": sender_id,
+                            "sender_account_id": sender_id,
+                            "sender_owner_id": int(configured_by_id[sender_id]["owner_id"]),
+                            "stopped_accounts": sorted(stopped_sender_ids),
+                            "paused_accounts": sorted(effective_sender_ids),
+                            "technical_disabled_accounts": sorted(technical_disabled_sender_ids),
+                            "failover_count": failover_count,
+                            "auto_switch_technical": auto_switch_technical,
+                            "run_id": run_id,
+                            "restriction_sender_id": sender_id,
+                            "pause_reason": error,
+                            "skip_chat_title": skip_chat_title,
+                        })
+                    # Ждём именно разрешённого снятия внутренней паузы; затем повторяем текущего адресата.
+                    if await _wait_while_paused(stop_event, pause_event):
+                        stopped_sender_ids.add(sender_id)
+                        break
+                    continue
 
-                await db.add_log(employee["id"], template["id"], status, error)
-                await report_progress(sender_id, employee, template, status, error)
+                if status == "failed" and error_kind == "technical_partial":
+                    await record_final(sender_id, job, status, error)
+                    await db.set_broadcast_run_paused(run_id, f"technical_partial:{error or 'technical_partial'}", sender_id)
+                    for active_pause_event in pause_events.values():
+                        active_pause_event.set()
+                    if await _wait_while_paused(stop_event, pause_event):
+                        stopped_sender_ids.add(sender_id)
+                        break
+                    index += 1
+                    continue
 
-                if index < len(jobs) - 1:
+                await record_final(sender_id, job, status, error)
+                index += 1
+
+                if index < len(jobs):
                     delay = random.uniform(delay_min, delay_max)
-                    if await _sleep_or_stopped(delay, stop_event):
+                    if await _sleep_with_controls(delay, stop_event, pause_event):
                         stopped_sender_ids.add(sender_id)
                         break
         finally:
             db.reset_current_owner_id(token)
 
+    async def finalize_jobs_without_sender(jobs: list[dict], reason: str):
+        for job in jobs:
+            attempted = sorted(job.get("attempted_sender_ids") or [])
+            fallback_sender = attempted[-1] if attempted else effective_sender_ids[0]
+            await record_final(fallback_sender, job, "failed", reason)
+
+    run_status = "completed"
     try:
         await asyncio.gather(*[
             run_sender(sender_id, jobs_by_sender[sender_id])
             for sender_id in effective_sender_ids
         ])
+
+        # Обрабатываем технический failover волнами. Аккаунт, на котором произошёл
+        # технический сбой, больше не получает задания в этом запуске.
+        while failover_jobs and auto_switch_technical:
+            async with failover_lock:
+                pending_jobs = list(failover_jobs)
+                failover_jobs.clear()
+
+            healthy_sender_ids = [
+                sender_id
+                for sender_id in effective_sender_ids
+                if sender_id not in technical_disabled_sender_ids
+                and sender_id not in stopped_sender_ids
+            ]
+            if not healthy_sender_ids:
+                await finalize_jobs_without_sender(
+                    pending_jobs,
+                    "Нет доступного исправного аккаунта для автоматического переключения",
+                )
+                break
+
+            assignments: dict[int, list[dict]] = {sender_id: [] for sender_id in healthy_sender_ids}
+            unassigned: list[dict] = []
+            cursor = 0
+            for job in pending_jobs:
+                attempted = set(job.get("attempted_sender_ids") or set())
+                eligible = [sender_id for sender_id in healthy_sender_ids if sender_id not in attempted]
+                if not eligible:
+                    unassigned.append(job)
+                    continue
+                sender_id = eligible[cursor % len(eligible)]
+                cursor += 1
+                assignments[sender_id].append(job)
+
+            if unassigned:
+                await finalize_jobs_without_sender(
+                    unassigned,
+                    "Все выбранные аккаунты уже оказались технически недоступны для этого задания",
+                )
+
+            active_assignments = [
+                (sender_id, jobs)
+                for sender_id, jobs in assignments.items()
+                if jobs
+            ]
+            if not active_assignments:
+                break
+            await asyncio.gather(*[
+                run_sender(sender_id, jobs)
+                for sender_id, jobs in active_assignments
+            ])
+
+        if stopped_sender_ids:
+            run_status = "stopped"
+        elif technical_disabled_sender_ids and failed:
+            run_status = "completed_with_errors"
+    except Exception:
+        run_status = "error"
+        raise
     finally:
+        current_run = await db.get_broadcast_run(run_id)
+        if current_run and current_run.get("status") == "paused":
+            run_status = "paused"
+        await db.finish_broadcast_run(
+            run_id,
+            sent=sent,
+            failed=failed,
+            skipped=skipped,
+            status=run_status,
+        )
         await _unregister_broadcast_sender_ids(effective_sender_ids)
 
     return {
+        "run_id": run_id,
         "sent": sent,
         "failed": failed,
         "skipped": skipped,
         "templates_used": len(used_template_ids),
         "stopped": bool(stopped_sender_ids),
         "stopped_accounts": sorted(stopped_sender_ids),
+        "technical_disabled_accounts": sorted(technical_disabled_sender_ids),
+        "failover_count": failover_count,
+        "auto_switch_technical": auto_switch_technical,
         "senders_used": len(effective_sender_ids),
         "skip_chat_title": skip_chat_title,
     }
 
+
+async def resume_broadcast_run(
+    run_id: int,
+    progress_callback: ProgressCallback | None = None,
+) -> dict:
+    """Восстанавливает pending-очередь после перезапуска процесса/паузы."""
+    run_id = int(run_id)
+    lock = _resume_run_locks.setdefault(run_id, asyncio.Lock())
+    if lock.locked():
+        raise ValueError("Эта рассылка уже продолжает работу")
+    async with lock:
+        run = await db.get_broadcast_run(run_id)
+        if not run:
+            raise ValueError("Рассылка не найдена")
+        if run.get("status") in {"completed", "completed_with_errors"}:
+            raise ValueError("Эта рассылка уже завершена")
+        await db.recover_sending_broadcast_items(run_id)
+        items = await db.get_broadcast_run_items(run_id, ["pending"])
+        if not items:
+            stats = await db.refresh_broadcast_run_stats(run_id)
+            await db.finish_broadcast_run(run_id, sent=stats["sent"], failed=stats["failed"], skipped=stats["skipped"])
+            return {"run_id": run_id, **stats, "stopped": False, "senders_used": 0}
+
+        selected_sender_ids = db.parse_broadcast_sender_ids(run)
+        if not selected_sender_ids:
+            selected_sender_ids = list(dict.fromkeys(int(item["sender_account_id"]) for item in items if item.get("sender_account_id")))
+        if not selected_sender_ids:
+            raise ValueError("У запуска не сохранены аккаунты отправки")
+
+        authorized = []
+        for sender_id in selected_sender_ids:
+            if await is_authorized(sender_id):
+                authorized.append(sender_id)
+        if not authorized:
+            raise ValueError("Нет авторизованных аккаунтов для продолжения")
+
+        await db.set_broadcast_run_running(run_id)
+        stop_events, pause_events = await _register_broadcast_sender_ids(authorized)
+        delay_min, delay_max = await get_delay_range()
+        sent_now = failed_now = skipped_now = 0
+        stopped = False
+        try:
+            for offset, item in enumerate(items):
+                sender_id = int(item.get("sender_account_id") or authorized[offset % len(authorized)])
+                if sender_id not in authorized:
+                    sender_id = authorized[offset % len(authorized)]
+                stop_event = stop_events[sender_id]
+                pause_event = pause_events[sender_id]
+                if await _wait_while_paused(stop_event, pause_event):
+                    stopped = True
+                    break
+                employee = {
+                    "id": item.get("employee_id"), "telegram_id": item.get("telegram_id"),
+                    "username": item.get("username"), "full_name": item.get("full_name"),
+                }
+                template = await db.get_template(int(item["template_id"])) if item.get("template_id") else None
+                if not template:
+                    await db.update_broadcast_run_item(run_id, int(item["position"]), sender_account_id=sender_id, status="failed", error="Шаблон удалён")
+                    failed_now += 1
+                    continue
+                await db.update_broadcast_run_item(run_id, int(item["position"]), sender_account_id=sender_id, status="sending", error=None)
+                if await db.has_delivery(employee.get("telegram_id"), employee.get("username")):
+                    await db.update_broadcast_run_item(run_id, int(item["position"]), sender_account_id=sender_id, status="skipped", error="Уже было отправлено с одного из аккаунтов")
+                    skipped_now += 1
+                    continue
+                reserved = await db.reserve_delivery(
+                    telegram_id=employee.get("telegram_id"), username=employee.get("username"),
+                    full_name=employee.get("full_name"), sender_account_id=sender_id,
+                    template_id=template.get("id"), source_kind="broadcast_resume",
+                )
+                if not reserved:
+                    await db.update_broadcast_run_item(run_id, int(item["position"]), sender_account_id=sender_id, status="skipped", error="Уже было отправлено/зарезервировано")
+                    skipped_now += 1
+                    continue
+                ok, error, kind = await send_to_employee_detailed(employee, template, sender_id=sender_id)
+                await db.finish_delivery(
+                    telegram_id=employee.get("telegram_id"), username=employee.get("username"), success=ok, error=error,
+                )
+                if ok:
+                    status = "sent"; sent_now += 1
+                elif kind == "restriction":
+                    await db.update_broadcast_run_item(run_id, int(item["position"]), sender_account_id=sender_id, status="pending", error=error)
+                    await db.set_broadcast_run_paused(run_id, f"restriction:{error or 'restriction'}", sender_id)
+                    async with _active_broadcast_lock:
+                        _restriction_sender_for_run[run_id] = sender_id
+                        for active_sender_id in authorized:
+                            _restricted_run_by_sender[active_sender_id] = run_id
+                    for event in pause_events.values():
+                        event.set()
+                    stopped = True
+                    break
+                else:
+                    status = "failed"; failed_now += 1
+                await db.update_broadcast_run_item(run_id, int(item["position"]), sender_account_id=sender_id, status=status, error=error)
+                if progress_callback:
+                    stats = await db.refresh_broadcast_run_stats(run_id)
+                    await progress_callback({"run_id": run_id, "total": int(run.get("total") or 0), **stats, "current": employee, "status": status, "error": error, "sender_account_id": sender_id})
+                if offset < len(items) - 1:
+                    await _sleep_with_controls(random.uniform(delay_min, delay_max), stop_event, pause_event)
+        finally:
+            await _unregister_broadcast_sender_ids(authorized)
+
+        stats = await db.refresh_broadcast_run_stats(run_id)
+        latest = await db.get_broadcast_run(run_id)
+        if latest and latest.get("status") != "paused" and not stopped:
+            await db.finish_broadcast_run(run_id, sent=stats["sent"], failed=stats["failed"], skipped=stats["skipped"], status="completed_with_errors" if stats["failed"] else "completed")
+        return {"run_id": run_id, **stats, "stopped": stopped, "senders_used": len(authorized)}
 
 async def import_group_members(group_link_or_id: str) -> list[dict]:
     """Возвращает список участников указанной группы/канала в формате для bulk_add_employees."""

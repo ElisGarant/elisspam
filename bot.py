@@ -164,6 +164,17 @@ class AccessAdmin(StatesGroup):
     waiting_username = State()
 
 
+class AddKeywordWatch(StatesGroup):
+    choosing_account = State()
+    waiting_chat = State()
+    choosing_template = State()
+    waiting_keywords = State()
+
+
+class RegistryCheck(StatesGroup):
+    waiting_target = State()
+
+
 # ---------------- Главное меню ----------------
 
 def main_menu_kb() -> InlineKeyboardMarkup:
@@ -171,9 +182,11 @@ def main_menu_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="👥 Пользователи", callback_data="menu_employees")],
         [InlineKeyboardButton(text="📝 Шаблоны сообщений", callback_data="menu_templates")],
         [InlineKeyboardButton(text="📤 Разовая рассылка", callback_data="menu_broadcast")],
-        [InlineKeyboardButton(text="⏹ Остановить рассылку", callback_data="bcast_stop_menu")],
+        [InlineKeyboardButton(text="⏯ Управление рассылкой", callback_data="bcast_control_menu")],
         [InlineKeyboardButton(text="⏰ Расписание", callback_data="menu_schedule")],
         [InlineKeyboardButton(text="📊 Логи рассылок", callback_data="menu_logs")],
+        [InlineKeyboardButton(text="🔎 Автопарсер", callback_data="menu_watches")],
+        [InlineKeyboardButton(text="📚 Реестр отправок", callback_data="menu_delivery_registry")],
         [InlineKeyboardButton(text="🔐 Авторизация юзербота", callback_data="menu_auth")],
         [InlineKeyboardButton(text="⚙️ Настройки", callback_data="menu_settings")],
     ]
@@ -1074,8 +1087,27 @@ async def tpl_delete(callback: CallbackQuery):
 # ---------------- Раздел: Разовая рассылка ----------------
 
 def _broadcast_stop_kb() -> InlineKeyboardMarkup:
+    # Название функции оставлено для совместимости со старым кодом.
+    # В интерфейсе полная остановка заменена на паузу/продолжение.
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⏹ Остановить", callback_data="bcast_stop_menu")],
+        [
+            InlineKeyboardButton(text="⏸ Пауза", callback_data="bcast_pause_all"),
+            InlineKeyboardButton(text="▶️ Продолжить", callback_data="bcast_resume_all"),
+        ],
+        [InlineKeyboardButton(text="⏯ Управление аккаунтами", callback_data="bcast_control_menu")],
+    ])
+
+
+def _restriction_pause_kb(run_id: int, sender_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="🔄 Проверить и продолжить",
+            callback_data=f"bcast_check_resume_{int(run_id)}_{int(sender_id)}",
+        )],
+        [
+            InlineKeyboardButton(text="👥 Оставшиеся", callback_data=f"bcast_remaining_{int(run_id)}"),
+            InlineKeyboardButton(text="📋 Результаты", callback_data=f"bcast_results_{int(run_id)}"),
+        ],
     ])
 
 
@@ -1137,9 +1169,10 @@ async def _send_broadcast_account_selector(
     for account in accounts:
         account_id = int(account["id"])
         mark = "✅" if account_id in selected_set else "⬜️"
+        health_icon, _health_text = _account_health_text(account)
         kb_rows.append([
             InlineKeyboardButton(
-                text=f"{mark} {account['label']}",
+                text=f"{mark} {health_icon} {account['label']}",
                 callback_data=f"bcast_acc_toggle_{account_id}",
             )
         ])
@@ -1222,6 +1255,12 @@ async def _build_broadcast_confirm(data: dict, accounts: list[dict]) -> tuple[st
         if skip_chat_title
         else "Фильтр: без проверки чата"
     )
+    auto_switch = await _auto_switch_technical_enabled()
+    auto_switch_line = (
+        "Тех. failover: ВКЛ — при разлогине/сбое соединения очередь перейдёт на другой выбранный аккаунт"
+        if auto_switch
+        else "Тех. failover: ВЫКЛ"
+    )
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Отправить", callback_data="bcast_confirm_yes")],
         [InlineKeyboardButton(text="⬅️ Назад к фильтру", callback_data="bcast_confirm_back_skip")],
@@ -1232,7 +1271,8 @@ async def _build_broadcast_confirm(data: dict, accounts: list[dict]) -> tuple[st
         f"Получателей: {len(employees)} (группа: {group_name})\n"
         f"Аккаунтов отправки: {len(selected_account_ids)}\n"
         f"{account_lines}\n"
-        f"{skip_line}\n\n"
+        f"{skip_line}\n"
+        f"{auto_switch_line}\n\n"
         f"Текст:\n{preview}\n\nОтправляем?"
     )
     return text, kb
@@ -1258,16 +1298,24 @@ async def _show_broadcast_confirm(anchor: Message | CallbackQuery, state: FSMCon
 
 async def _active_broadcast_accounts_for_current_owner() -> list[dict]:
     active_account_ids = await userbot.get_active_broadcast_sender_ids()
+    paused_account_ids = set(await userbot.get_paused_broadcast_sender_ids())
     current_owner_id = db.get_current_owner_id()
 
     accounts = await userbot.get_sender_accounts(sender_ids=active_account_ids, authorized_only=False)
     if not db.is_root_admin(current_owner_id):
         accounts = [account for account in accounts if account["owner_id"] == current_owner_id]
     labels = _account_label_map(accounts)
-    return [
-        {"id": int(account["id"]), "label": labels.get(int(account["id"]), f"id {account['id']}")}
-        for account in accounts
-    ]
+    result = []
+    for account in accounts:
+        health_icon, health_text = _account_health_text(account)
+        result.append({
+            "id": int(account["id"]),
+            "label": f"{health_icon} {labels.get(int(account['id']), f'id {account['id']}')}",
+            "paused": int(account["id"]) in paused_account_ids,
+            "health_status": account.get("health_status") or "unknown",
+            "health_text": health_text,
+        })
+    return result
 
 
 @router.callback_query(F.data == "menu_broadcast")
@@ -1282,6 +1330,7 @@ async def menu_broadcast(callback: CallbackQuery, state: FSMContext):
     if len(templates) > 1:
         kb_rows.append([InlineKeyboardButton(text="🔀 Ротация всех шаблонов", callback_data="bcast_tpl_0")])
     kb_rows.extend([[InlineKeyboardButton(text=t["name"], callback_data=f"bcast_tpl_{t['id']}")] for t in templates])
+    kb_rows.append([InlineKeyboardButton(text="📂 Последние рассылки", callback_data="bcast_recent")])
     kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_main")])
     await state.set_state(BroadcastNow.choosing_template)
     rotation_hint = "\n\nДля чередования текстов выбери «🔀 Ротация всех шаблонов»." if len(templates) > 1 else ""
@@ -1289,6 +1338,27 @@ async def menu_broadcast(callback: CallbackQuery, state: FSMContext):
         "Выбери шаблон для рассылки:" + rotation_hint,
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
     )
+    await callback.answer()
+
+
+
+@router.callback_query(F.data == "bcast_recent")
+@admin_only
+async def broadcast_recent(callback: CallbackQuery):
+    runs = await db.get_recent_broadcast_runs(15)
+    if not runs:
+        await callback.answer("Запусков пока нет.", show_alert=True)
+        return
+    rows = []
+    lines = []
+    for run in runs:
+        pending = await db.get_broadcast_run_items(int(run["id"]), ["pending", "sending"])
+        status = run.get("status") or "unknown"
+        icon = "⏸" if status == "paused" else ("✅" if status.startswith("completed") else "▶️")
+        lines.append(f"{icon} #{run['id']} — {status}; отправлено {run.get('sent', 0)}, осталось {len(pending)}")
+        rows.append([InlineKeyboardButton(text=f"{icon} Рассылка #{run['id']}", callback_data=f"bcast_results_{run['id']}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_broadcast")])
+    await callback.message.answer("📂 Последние рассылки\n\n" + "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     await callback.answer()
 
 
@@ -1497,15 +1567,44 @@ async def broadcast_execute(callback: CallbackQuery, state: FSMContext):
         sender_label = account_labels.get(sender_id, f"id {sender_id}") if sender_id else "неизвестно"
         error = progress.get("error")
         error_line = f"\nПоследняя ошибка: {error[:120]}" if error else ""
+        paused_accounts = progress.get("paused_accounts") or []
+        pause_line = (
+            "\n⏸ Рассылка поставлена на паузу. Если Telegram ограничил отправку, "
+            "сначала дождись снятия ограничения, затем нажми «Продолжить»."
+            if paused_accounts else ""
+        )
+        technical_disabled = progress.get("technical_disabled_accounts") or []
+        failover_count = int(progress.get("failover_count") or 0)
+        failover_line = ""
+        if technical_disabled:
+            disabled_labels = ", ".join(
+                account_labels.get(account_id, f"id {account_id}")
+                for account_id in technical_disabled
+            )
+            failover_line = (
+                f"\n⚠️ Технически исключены: {disabled_labels}"
+                + (f"\n🔁 Переназначено заданий: {failover_count}" if failover_count else "")
+            )
         rotation_line = (
             f"\n🔀 Шаблонов использовано: {progress['templates_used']}"
             if data.get("template_id") == 0
             else ""
         )
+        restriction_sender_id = progress.get("restriction_sender_id")
+        progress_kb = (
+            _restriction_pause_kb(int(progress.get("run_id")), int(restriction_sender_id))
+            if progress.get("status") == "paused_restriction" and progress.get("run_id") and restriction_sender_id
+            else _broadcast_stop_kb()
+        )
+        progress_title = (
+            "⏸ Рассылка приостановлена\n\n"
+            if progress.get("status") == "paused_restriction"
+            else "⏳ Рассылка идёт\n\n"
+        )
         try:
             await callback.message.edit_text(
-                "⏳ Рассылка идёт\n\n"
-                f"Аккаунтов отправки: {len(selected_account_ids)}\n"
+                progress_title
+                + f"Аккаунтов отправки: {len(selected_account_ids)}\n"
                 f"{skip_line}"
                 f"Прогресс: {processed}/{total} ({percent}%)\n"
                 f"✅ Успешно: {sent}\n"
@@ -1515,8 +1614,10 @@ async def broadcast_execute(callback: CallbackQuery, state: FSMContext):
                 f"Аккаунт: {sender_label}\n"
                 f"Последний: {current_label} — {last_status}"
                 f"{rotation_line}"
-                f"{error_line}",
-                reply_markup=_broadcast_stop_kb(),
+                f"{error_line}"
+                f"{failover_line}"
+                f"{pause_line}",
+                reply_markup=progress_kb,
             )
         except Exception as e:
             logger.debug("Не удалось обновить live-скоринг рассылки: %s", e)
@@ -1528,6 +1629,7 @@ async def broadcast_execute(callback: CallbackQuery, state: FSMContext):
             progress_callback=update_broadcast_progress,
             sender_account_ids=selected_account_ids,
             skip_existing_chat=data.get("skip_existing_chat"),
+            group_name=data.get("group_name"),
         )
     except ValueError as e:
         await state.clear()
@@ -1554,93 +1656,441 @@ async def broadcast_execute(callback: CallbackQuery, state: FSMContext):
     if stopped_accounts:
         stopped_labels = ", ".join(account_labels.get(account_id, f"id {account_id}") for account_id in stopped_accounts)
         stopped_note = f"\nОстановлено на аккаунтах: {stopped_labels}"
+    technical_disabled = result.get("technical_disabled_accounts") or []
+    technical_note = ""
+    if technical_disabled:
+        disabled_labels = ", ".join(
+            account_labels.get(account_id, f"id {account_id}")
+            for account_id in technical_disabled
+        )
+        technical_note = f"\n⚠️ Технически исключены: {disabled_labels}"
+        if result.get("failover_count"):
+            technical_note += f"\n🔁 Переназначено заданий: {result['failover_count']}"
     status_title = "⏹ Рассылка остановлена" if result.get("stopped") else "✅ Готово!"
     processed = result["sent"] + result["failed"] + result.get("skipped", 0)
     processed_note = f"\nОбработано: {processed}/{total}" if result.get("stopped") else ""
+    result_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="📋 Результаты этой рассылки",
+            callback_data=f"bcast_results_{result['run_id']}",
+        )],
+        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="menu_main")],
+    ])
     await callback.message.answer(
         f"{status_title}\nОтправлено: {result['sent']}\nПропущено: {result.get('skipped', 0)}\nОшибок: {result['failed']}\n"
         f"Скоринг доставки: {final_score}%"
         f"{processed_note}"
         f"{rotation_note}"
         f"{skip_note}"
+        f"{technical_note}"
         f"{stopped_note}",
-        reply_markup=main_menu_kb()
+        reply_markup=result_kb
     )
 
 
-@router.callback_query(F.data == "bcast_stop_menu")
+@router.callback_query(F.data == "bcast_control_menu")
 @admin_only
-async def broadcast_stop_menu(callback: CallbackQuery):
+async def broadcast_control_menu(callback: CallbackQuery):
     accounts = await _active_broadcast_accounts_for_current_owner()
     if not accounts:
         await callback.answer("Активных рассылок нет.", show_alert=True)
         return
 
-    kb_rows = []
-    if len(accounts) > 1:
-        kb_rows.append([InlineKeyboardButton(text="⏹ Остановить все", callback_data="bcast_stop_all")])
+    kb_rows = [
+        [
+            InlineKeyboardButton(text="⏸ Пауза для всех", callback_data="bcast_pause_all"),
+            InlineKeyboardButton(text="▶️ Продолжить все", callback_data="bcast_resume_all"),
+        ]
+    ]
     for account in accounts:
-        kb_rows.append([
-            InlineKeyboardButton(
-                text=f"⏹ {account['label']}",
-                callback_data=f"bcast_stop_{account['id']}",
-            )
-        ])
+        if account.get("paused"):
+            text = f"▶️ {account['label']}"
+            data = f"bcast_resume_{account['id']}"
+        else:
+            text = f"⏸ {account['label']}"
+            data = f"bcast_pause_{account['id']}"
+        kb_rows.append([InlineKeyboardButton(text=text, callback_data=data)])
     kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_main")])
 
+    status_lines = [
+        f"{'⏸' if account.get('paused') else '▶️'} {account['label']}"
+        for account in accounts
+    ]
     await callback.message.answer(
-        "Выбери аккаунт, на котором нужно остановить активную рассылку:",
+        "⏯ Управление активной рассылкой\n\n"
+        "Пауза сохраняет текущую очередь. После «Продолжить» рассылка идёт с того же места.\n\n"
+        + "\n".join(status_lines),
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
     )
     await callback.answer()
 
 
-@router.callback_query(F.data == "bcast_stop_all")
+@router.callback_query(F.data == "bcast_pause_all")
 @admin_only
-async def broadcast_stop_all(callback: CallbackQuery):
+async def broadcast_pause_all(callback: CallbackQuery):
     accounts = await _active_broadcast_accounts_for_current_owner()
-    stopped_account_ids = []
+    changed = []
     for account in accounts:
-        stopped_account_ids.extend(await userbot.request_broadcast_stop(account["id"]))
-    stopped_account_ids = sorted(set(stopped_account_ids))
-    if not stopped_account_ids:
-        await callback.answer("Активных рассылок нет.", show_alert=True)
+        changed.extend(await userbot.request_broadcast_pause(account["id"]))
+    if not changed:
+        await callback.answer("Активных рассылок нет или они уже на паузе.", show_alert=True)
         return
-
-    labels = _account_label_map(accounts)
-    stopped_labels = ", ".join(labels.get(account_id, f"id {account_id}") for account_id in stopped_account_ids)
-    await callback.message.edit_text(
-        f"⏹ Остановка запрошена: {stopped_labels}",
-        reply_markup=main_menu_kb(),
-    )
-    await callback.answer("Останавливаю рассылку.")
+    await callback.answer("⏸ Рассылка поставлена на паузу.", show_alert=True)
 
 
-@router.callback_query(F.data.startswith("bcast_stop_"))
+@router.callback_query(F.data == "bcast_resume_all")
 @admin_only
-async def broadcast_stop_account(callback: CallbackQuery):
+async def broadcast_resume_all(callback: CallbackQuery):
+    accounts = await _active_broadcast_accounts_for_current_owner()
+    changed = []
+    for account in accounts:
+        changed.extend(await userbot.request_broadcast_resume(account["id"]))
+    if not changed:
+        await callback.answer("Нет рассылок на паузе.", show_alert=True)
+        return
+    await callback.answer("▶️ Рассылка продолжена.", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("bcast_pause_") & (F.data != "bcast_pause_all"))
+@admin_only
+async def broadcast_pause_account(callback: CallbackQuery):
     try:
-        account_id = int(callback.data.split("_")[-1])
+        account_id = int(callback.data.rsplit("_", 1)[-1])
     except ValueError:
         await callback.answer()
         return
-
     accounts = await _active_broadcast_accounts_for_current_owner()
-    labels = _account_label_map(accounts)
-    if account_id not in labels:
+    if account_id not in {a["id"] for a in accounts}:
         await callback.answer("Эта рассылка уже не активна или недоступна.", show_alert=True)
         return
+    changed = await userbot.request_broadcast_pause(account_id)
+    await callback.answer("⏸ Пауза включена." if changed else "Уже на паузе.", show_alert=True)
 
-    stopped_account_ids = await userbot.request_broadcast_stop(account_id)
-    if not stopped_account_ids:
-        await callback.answer("Эта рассылка уже остановлена.", show_alert=True)
+
+@router.callback_query(F.data.startswith("bcast_resume_") & (F.data != "bcast_resume_all"))
+@admin_only
+async def broadcast_resume_account(callback: CallbackQuery):
+    try:
+        account_id = int(callback.data.rsplit("_", 1)[-1])
+    except ValueError:
+        await callback.answer()
+        return
+    accounts = await _active_broadcast_accounts_for_current_owner()
+    if account_id not in {a["id"] for a in accounts}:
+        await callback.answer("Эта рассылка уже не активна или недоступна.", show_alert=True)
+        return
+    changed = await userbot.request_broadcast_resume(account_id)
+    await callback.answer("▶️ Рассылка продолжена." if changed else "Этот аккаунт не на паузе.", show_alert=True)
+
+
+def _broadcast_result_recipient(item: dict) -> str:
+    username = item.get("username")
+    full_name = item.get("full_name")
+    telegram_id = item.get("telegram_id")
+    if username:
+        handle = f"@{username.lstrip('@')}"
+        return f"{full_name} ({handle})" if full_name else handle
+    if telegram_id:
+        return f"{full_name} (id {telegram_id})" if full_name else f"id {telegram_id}"
+    return full_name or "неизвестный пользователь"
+
+
+async def _show_broadcast_result_list(callback: CallbackQuery, run_id: int, sent_only: bool):
+    run = await db.get_broadcast_run(run_id)
+    if not run:
+        await callback.answer("Отчёт не найден.", show_alert=True)
+        return
+    statuses = ["sent"] if sent_only else ["failed", "skipped"]
+    items = await db.get_broadcast_run_items(run_id, statuses)
+    title = "✅ Кому отправлено" if sent_only else "❌ Кому не отправлено"
+    lines = []
+    for item in items[:60]:
+        line = f"• {_broadcast_result_recipient(item)}"
+        if not sent_only:
+            status_label = "пропущено" if item.get("status") == "skipped" else "ошибка"
+            reason = (item.get("error") or "причина не указана").replace("\n", " ")
+            line += f" — {status_label}: {reason[:140]}"
+        lines.append(line)
+    if len(items) > 60:
+        lines.append(f"\n…ещё {len(items) - 60}. Полный список можно скачать CSV из отчёта.")
+    text = f"{title} — рассылка #{run_id}\nВсего: {len(items)}\n\n" + ("\n".join(lines) if lines else "Список пуст.")
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ К отчёту", callback_data=f"bcast_results_{run_id}")],
+    ])
+    await callback.message.answer(text[:3900], reply_markup=kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("bcast_results_"))
+@admin_only
+async def broadcast_results(callback: CallbackQuery):
+    try:
+        run_id = int(callback.data.rsplit("_", 1)[-1])
+    except ValueError:
+        await callback.answer()
+        return
+    run = await db.get_broadcast_run(run_id)
+    if not run:
+        await callback.answer("Отчёт не найден.", show_alert=True)
+        return
+    live_stats = await db.refresh_broadcast_run_stats(run_id)
+    run.update({key: live_stats[key] for key in ("sent", "failed", "skipped")})
+    not_sent = int(run.get("failed") or 0) + int(run.get("skipped") or 0)
+    pending_items = await db.get_broadcast_run_items(run_id, ["pending", "sending"])
+    kb_rows = [
+        [InlineKeyboardButton(text=f"✅ Отправлено ({run.get('sent', 0)})", callback_data=f"bcast_result_sent_{run_id}")],
+        [InlineKeyboardButton(text=f"❌ Не отправлено ({not_sent})", callback_data=f"bcast_result_unsent_{run_id}")],
+    ]
+    if pending_items:
+        kb_rows.append([InlineKeyboardButton(text=f"👥 Оставшиеся ({len(pending_items)})", callback_data=f"bcast_remaining_{run_id}")])
+        if (run.get("status") == "paused" and run.get("pause_sender_account_id")
+                and str(run.get("pause_reason") or "").startswith("restriction:")):
+            kb_rows.append([InlineKeyboardButton(
+                text="🔄 Проверить и продолжить",
+                callback_data=f"bcast_check_resume_{run_id}_{int(run['pause_sender_account_id'])}",
+            )])
+        elif run.get("status") == "paused":
+            kb_rows.append([InlineKeyboardButton(
+                text="▶️ Продолжить с checkpoint",
+                callback_data=f"bcast_resume_checkpoint_{run_id}",
+            )])
+    kb_rows.extend([
+        [InlineKeyboardButton(text="📥 Скачать полный CSV", callback_data=f"bcast_result_csv_{run_id}")],
+        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="menu_main")],
+    ])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    await callback.message.answer(
+        f"📋 Результаты рассылки #{run_id}\n\n"
+        f"Всего: {run.get('total', 0)}\n"
+        f"✅ Отправлено: {run.get('sent', 0)}\n"
+        f"⏭ Пропущено: {run.get('skipped', 0)}\n"
+        f"❌ Ошибок: {run.get('failed', 0)}\n"
+        f"Статус: {run.get('status', 'unknown')}",
+        reply_markup=kb,
+    )
+    await callback.answer()
+
+
+
+@router.callback_query(F.data.startswith("bcast_remaining_"))
+@admin_only
+async def broadcast_remaining(callback: CallbackQuery):
+    try:
+        run_id = int(callback.data.rsplit("_", 1)[-1])
+    except ValueError:
+        await callback.answer()
+        return
+    run = await db.get_broadcast_run(run_id)
+    if not run:
+        await callback.answer("Рассылка не найдена.", show_alert=True)
+        return
+    items = await db.get_broadcast_run_items(run_id, ["pending", "sending"])
+    lines = [f"• {_broadcast_result_recipient(item)}" for item in items[:60]]
+    if len(items) > 60:
+        lines.append(f"…ещё {len(items) - 60}")
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["position", "full_name", "username", "telegram_id", "sender_account_id", "template_id", "status", "error"])
+    for item in items:
+        writer.writerow([
+            item.get("position"), item.get("full_name"), item.get("username"), item.get("telegram_id"),
+            item.get("sender_account_id"), item.get("template_id"), item.get("status"), item.get("error"),
+        ])
+    kb_rows = [[InlineKeyboardButton(text="⬅️ К отчёту", callback_data=f"bcast_results_{run_id}")]]
+    if (run.get("status") == "paused" and run.get("pause_sender_account_id")
+            and str(run.get("pause_reason") or "").startswith("restriction:")):
+        kb_rows.insert(0, [InlineKeyboardButton(
+            text="🔄 Проверить и продолжить",
+            callback_data=f"bcast_check_resume_{run_id}_{int(run['pause_sender_account_id'])}",
+        )])
+    elif run.get("status") == "paused":
+        kb_rows.insert(0, [InlineKeyboardButton(
+            text="▶️ Продолжить с checkpoint",
+            callback_data=f"bcast_resume_checkpoint_{run_id}",
+        )])
+    await callback.message.answer(
+        f"👥 Оставшиеся — рассылка #{run_id}\nВсего: {len(items)}\n\n" + ("\n".join(lines) if lines else "Список пуст."),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+    )
+    if items:
+        await callback.message.answer_document(
+            BufferedInputFile(output.getvalue().encode("utf-8-sig"), filename=f"broadcast_{run_id}_remaining.csv"),
+            caption=f"👥 Оставшиеся пользователи рассылки #{run_id}",
+        )
+    await callback.answer()
+
+
+
+@router.callback_query(F.data.startswith("bcast_resume_checkpoint_"))
+@admin_only
+async def broadcast_resume_checkpoint(callback: CallbackQuery):
+    try:
+        run_id = int(callback.data.rsplit("_", 1)[-1])
+    except ValueError:
+        await callback.answer()
+        return
+    run = await db.get_broadcast_run(run_id)
+    if not run:
+        await callback.answer("Рассылка не найдена.", show_alert=True)
+        return
+    if str(run.get("pause_reason") or "").startswith("restriction:"):
+        await callback.answer("Сначала используй «Проверить и продолжить».", show_alert=True)
+        return
+    active_ids = await userbot.get_active_broadcast_sender_ids()
+    run_sender_ids = set(db.parse_broadcast_sender_ids(run))
+    active_for_run = [sender_id for sender_id in active_ids if sender_id in run_sender_ids]
+    if active_for_run:
+        changed = []
+        for sender_id in active_for_run:
+            changed.extend(await userbot.request_broadcast_resume(sender_id))
+        if changed:
+            await db.set_broadcast_run_running(run_id)
+            await callback.answer("▶️ Продолжено с текущего места.", show_alert=True)
+            return
+    await callback.answer("▶️ Восстанавливаю очередь...")
+    try:
+        result = await userbot.resume_broadcast_run(run_id)
+    except ValueError as exc:
+        await callback.message.answer(f"⚠️ Не удалось продолжить: {exc}")
+        return
+    await callback.message.answer(
+        f"✅ Обработка checkpoint завершена.\n"
+        f"Отправлено: {result.get('sent', 0)}\nОшибок: {result.get('failed', 0)}\n"
+        f"Осталось: {result.get('pending', 0)}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📋 Результаты", callback_data=f"bcast_results_{run_id}")]
+        ]),
+    )
+
+
+@router.callback_query(F.data.startswith("bcast_check_resume_"))
+@admin_only
+async def broadcast_check_and_resume(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    try:
+        run_id = int(parts[-2])
+        sender_id = int(parts[-1])
+    except (ValueError, IndexError):
+        await callback.answer()
+        return
+    run = await db.get_broadcast_run(run_id)
+    if not run:
+        await callback.answer("Рассылка не найдена.", show_alert=True)
+        return
+    allowed_sender_ids = set(db.parse_broadcast_sender_ids(run))
+    if sender_id not in allowed_sender_ids and sender_id != run.get("pause_sender_account_id"):
+        await callback.answer("Этот аккаунт не относится к данной рассылке.", show_alert=True)
+        return
+    if run.get("status") not in {"paused", "running"}:
+        await callback.answer("Эта рассылка уже завершена.", show_alert=True)
+        return
+    await callback.answer("🔄 Проверяю статус аккаунта...")
+    try:
+        result = await userbot.check_spambot_status(sender_id)
+    except Exception as exc:
+        await callback.message.answer(f"⚠️ Не удалось проверить SpamBot: {type(exc).__name__}: {exc}")
+        return
+    restricted = result.get("restricted")
+    until = result.get("until")
+    if restricted is True:
+        until_text = until.strftime("%d.%m.%Y %H:%M UTC") if until else "срок не определён"
+        await db.set_broadcast_run_paused(run_id, f"restriction:Ограничение до {until_text}", sender_id)
+        await callback.message.answer(
+            f"🚫 Ограничение ещё действует.\n\nДо: {until_text}\nРассылка остаётся на паузе.",
+            reply_markup=_restriction_pause_kb(run_id, sender_id),
+        )
+        return
+    if restricted is None:
+        await callback.message.answer(
+            "⚠️ SpamBot не дал однозначного ответа. Рассылка остаётся на паузе.\n\n"
+            + (result.get("text") or ""),
+            reply_markup=_restriction_pause_kb(run_id, sender_id),
+        )
         return
 
-    await callback.message.edit_text(
-        f"⏹ Остановка запрошена: {labels.get(account_id, f'id {account_id}')}",
-        reply_markup=main_menu_kb(),
+    active_run_id = await userbot.get_restriction_run_for_sender(sender_id)
+    if active_run_id == run_id:
+        resumed_ids = await userbot.release_restriction_pause(run_id)
+        await callback.message.answer(
+            "✅ Ограничение больше не обнаружено.\n"
+            "▶️ Продолжаю сохранённую очередь с текущего места.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📋 Результаты", callback_data=f"bcast_results_{run_id}")]
+            ]),
+        )
+        return
+
+    # После рестарта процесса активных Event уже нет — восстанавливаем pending из SQLite.
+    await callback.message.answer("✅ Ограничение больше не обнаружено. Восстанавливаю сохранённую очередь…")
+    try:
+        result_run = await userbot.resume_broadcast_run(run_id)
+    except ValueError as exc:
+        await callback.message.answer(f"⚠️ Не удалось продолжить: {exc}")
+        return
+    await callback.message.answer(
+        f"✅ Продолжение завершено/запущено.\n"
+        f"Отправлено всего: {result_run.get('sent', 0)}\n"
+        f"Ошибок: {result_run.get('failed', 0)}\n"
+        f"Осталось: {result_run.get('pending', 0)}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📋 Результаты", callback_data=f"bcast_results_{run_id}")]
+        ]),
     )
-    await callback.answer("Останавливаю рассылку.")
+
+
+@router.callback_query(F.data.startswith("bcast_result_sent_"))
+@admin_only
+async def broadcast_result_sent(callback: CallbackQuery):
+    try:
+        run_id = int(callback.data.rsplit("_", 1)[-1])
+    except ValueError:
+        await callback.answer()
+        return
+    await _show_broadcast_result_list(callback, run_id, True)
+
+
+@router.callback_query(F.data.startswith("bcast_result_unsent_"))
+@admin_only
+async def broadcast_result_unsent(callback: CallbackQuery):
+    try:
+        run_id = int(callback.data.rsplit("_", 1)[-1])
+    except ValueError:
+        await callback.answer()
+        return
+    await _show_broadcast_result_list(callback, run_id, False)
+
+
+@router.callback_query(F.data.startswith("bcast_result_csv_"))
+@admin_only
+async def broadcast_result_csv(callback: CallbackQuery):
+    try:
+        run_id = int(callback.data.rsplit("_", 1)[-1])
+    except ValueError:
+        await callback.answer()
+        return
+    run = await db.get_broadcast_run(run_id)
+    if not run:
+        await callback.answer("Отчёт не найден.", show_alert=True)
+        return
+    items = await db.get_broadcast_run_items(run_id)
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "status", "full_name", "username", "telegram_id", "sender_account_id",
+        "template_id", "error", "timestamp",
+    ])
+    for item in items:
+        writer.writerow([
+            item.get("status"), item.get("full_name"), item.get("username"),
+            item.get("telegram_id"), item.get("sender_account_id"), item.get("template_id"),
+            item.get("error"), item.get("timestamp"),
+        ])
+    payload = output.getvalue().encode("utf-8-sig")
+    await callback.message.answer_document(
+        BufferedInputFile(payload, filename=f"broadcast_{run_id}_results.csv"),
+        caption=f"📋 Полный отчёт рассылки #{run_id}",
+    )
+    await callback.answer()
 
 
 # ---------------- Раздел: Расписание ----------------
@@ -1824,6 +2274,72 @@ async def _auth_accounts_for_current_owner() -> list[dict]:
     )
 
 
+async def _auto_switch_technical_enabled() -> bool:
+    raw = await db.get_setting("auto_switch_technical_accounts", "1")
+    return str(raw).strip().lower() not in {"0", "false", "off", "no"}
+
+
+def _account_health_text(account: dict) -> tuple[str, str]:
+    if not account.get("authorized"):
+        return "🔐", "не авторизован"
+    status = account.get("health_status") or "unknown"
+    if status == "ok":
+        return "✅", "работает"
+    if status == "technical_error":
+        return "⚠️", "техническая ошибка"
+    if status == "restricted":
+        return "🚫", "ограничение отправки"
+    if status == "unauthorized":
+        return "🔐", "не авторизован"
+    return "◻️", "не проверен"
+
+
+async def _render_auth_menu(callback: CallbackQuery, state: FSMContext | None = None):
+    if state is not None:
+        await state.clear()
+    accounts = await _auth_accounts_for_current_owner()
+    auto_switch = await _auto_switch_technical_enabled()
+    if accounts:
+        lines = ["Аккаунты отправки:"]
+        for account in accounts:
+            icon, status_text = _account_health_text(account)
+            line = f"{icon} {account['label']} — {status_text}"
+            error = account.get("health_error")
+            if error and (account.get("health_status") or "unknown") in {"technical_error", "restricted"}:
+                line += f"\n   ↳ {str(error).replace(chr(10), ' ')[:120]}"
+            lines.append(line)
+    else:
+        lines = ["Пока нет добавленных аккаунтов отправки."]
+
+    switch_label = "ВКЛ ✅" if auto_switch else "ВЫКЛ ⛔"
+    kb_rows = [
+        [InlineKeyboardButton(text="➕ Добавить аккаунт отправки", callback_data="auth_add")],
+        [InlineKeyboardButton(text="🩺 Проверить аккаунты", callback_data="auth_check_accounts")],
+        [InlineKeyboardButton(
+            text=f"🔁 Автопереключение при тех. сбоях: {switch_label}",
+            callback_data="auth_toggle_auto_switch",
+        )],
+    ]
+    for account in accounts:
+        if not account.get("authorized"):
+            kb_rows.append([
+                InlineKeyboardButton(
+                    text=f"🔐 Авторизовать {account['label']}",
+                    callback_data=f"auth_use_{account['id']}",
+                )
+            ])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_main")])
+
+    text = (
+        "🔐 Аккаунты юзерботов\n\n"
+        + "\n".join(lines)
+        + "\n\n🔁 Автопереключение используется только при технической недоступности "
+          "сессии/соединения. При PeerFlood, FloodWait или ограничении отправки "
+          "рассылка ставится на паузу."
+    )
+    await callback.message.edit_text(text[:3900], reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
+
+
 def _auth_methods_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📱 По номеру телефона", callback_data="auth_phone")],
@@ -1863,31 +2379,29 @@ def _auth_success_name(me) -> str:
 @router.callback_query(F.data == "menu_auth")
 @admin_only
 async def menu_auth(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    accounts = await _auth_accounts_for_current_owner()
-    if accounts:
-        lines = ["Аккаунты отправки:"]
-        for account in accounts:
-            mark = "✅" if account.get("authorized") else "🔐"
-            lines.append(f"{mark} {account['label']}")
-    else:
-        lines = ["Пока нет добавленных аккаунтов отправки."]
-
-    kb_rows = [[InlineKeyboardButton(text="➕ Добавить аккаунт отправки", callback_data="auth_add")]]
-    for account in accounts:
-        if not account.get("authorized"):
-            kb_rows.append([
-                InlineKeyboardButton(
-                    text=f"🔐 Авторизовать {account['label']}",
-                    callback_data=f"auth_use_{account['id']}",
-                )
-            ])
-    kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_main")])
-
-    text = "🔐 Авторизация юзерботов\n\n" + "\n".join(lines)
-    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
-    await callback.message.edit_text(text, reply_markup=kb)
+    await _render_auth_menu(callback, state)
     await callback.answer()
+
+
+@router.callback_query(F.data == "auth_check_accounts")
+@admin_only
+async def auth_check_accounts(callback: CallbackQuery, state: FSMContext):
+    await callback.answer("🩺 Проверяю сессии...")
+    await userbot.check_sender_accounts(owner_id=db.get_current_owner_id())
+    await _render_auth_menu(callback, state)
+
+
+@router.callback_query(F.data == "auth_toggle_auto_switch")
+@admin_only
+async def auth_toggle_auto_switch(callback: CallbackQuery, state: FSMContext):
+    enabled = await _auto_switch_technical_enabled()
+    await db.set_setting("auto_switch_technical_accounts", "0" if enabled else "1")
+    await _render_auth_menu(callback, state)
+    await callback.answer(
+        "Автопереключение при технических сбоях выключено." if enabled
+        else "Автопереключение при технических сбоях включено.",
+        show_alert=True,
+    )
 
 
 @router.callback_query(F.data == "auth_add")
@@ -2307,3 +2821,394 @@ def build_bot_and_dispatcher() -> tuple[Bot, Dispatcher]:
     dp = Dispatcher()
     dp.include_router(router)
     return bot, dp
+
+
+# ---------------- Автопарсер и единый реестр ----------------
+
+def _watch_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить правило", callback_data="watch_add_start")],
+        [InlineKeyboardButton(text="📋 Правила", callback_data="watch_list_btn")],
+        [InlineKeyboardButton(text="🧾 Найденные совпадения", callback_data="watch_hits")],
+        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="menu_main")],
+    ])
+
+
+def _watch_cancel_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="menu_watches")],
+    ])
+
+
+async def _watches_text() -> str:
+    rows = await db.get_monitored_chats()
+    if not rows:
+        body = "Пока нет выбранных чатов."
+    else:
+        lines = []
+        for row in rows[:20]:
+            kws = ", ".join(row.get("keywords_list") or [])
+            state = "✅" if row.get("enabled") else "⏸"
+            lines.append(
+                f"{state} #{row['id']} · аккаунт #{row['sender_account_id']}\n"
+                f"Чат: {row.get('chat_title') or row.get('chat_ref')}\n"
+                f"Ключи: {kws}\nШаблон: #{row['template_id']}"
+            )
+        body = "\n\n".join(lines)
+    return (
+        "🔎 Автопарсер по ключевым словам\n\n"
+        f"{body}\n\n"
+        "Управление — кнопками ниже. Автоответ в ЛС выполняется только если пользователь "
+        "раньше уже сам писал выбранному аккаунту; иначе совпадение только сохраняется в журнал."
+    )
+
+
+@router.callback_query(F.data == "menu_watches")
+@admin_only
+async def menu_watches(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text(await _watches_text(), reply_markup=_watch_menu_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "watch_add_start")
+@admin_only
+async def watch_add_start(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    accounts = await _sender_accounts_for_current_owner()
+    if not accounts:
+        await callback.message.edit_text(
+            "Нет авторизованных аккаунтов. Сначала авторизуй юзербот.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔐 Авторизация", callback_data="menu_auth")],
+                [InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_watches")],
+            ]),
+        )
+        await callback.answer()
+        return
+
+    rows = [
+        [InlineKeyboardButton(text=account["label"], callback_data=f"watch_acc_{account['id']}")]
+        for account in accounts
+    ]
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_watches")])
+    await state.set_state(AddKeywordWatch.choosing_account)
+    await callback.message.edit_text(
+        "1/4. Выбери аккаунт, который будет следить за чатом:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@router.callback_query(AddKeywordWatch.choosing_account, F.data.startswith("watch_acc_"))
+@admin_only
+async def watch_choose_account(callback: CallbackQuery, state: FSMContext):
+    try:
+        sender_id = int(callback.data.rsplit("_", 1)[-1])
+    except (TypeError, ValueError):
+        await callback.answer("Некорректный аккаунт.", show_alert=True)
+        return
+    accounts = await _sender_accounts_for_current_owner()
+    account = next((a for a in accounts if int(a["id"]) == sender_id), None)
+    if not account:
+        await callback.answer("Аккаунт недоступен.", show_alert=True)
+        return
+    await state.update_data(sender_id=sender_id, sender_label=account["label"])
+    await state.set_state(AddKeywordWatch.waiting_chat)
+    await callback.message.edit_text(
+        "2/4. Отправь ссылку, @username или ID чата/группы/канала, за которым нужно следить.\n\n"
+        f"Аккаунт: {account['label']}",
+        reply_markup=_watch_cancel_kb(),
+    )
+    await callback.answer()
+
+
+@router.message(AddKeywordWatch.waiting_chat)
+@admin_only
+async def watch_receive_chat(message: Message, state: FSMContext):
+    chat_ref = (message.text or "").strip()
+    if not chat_ref:
+        await message.answer("Укажи ссылку, @username или ID чата.", reply_markup=_watch_cancel_kb())
+        return
+    templates = await db.get_templates()
+    if not templates:
+        await state.clear()
+        await message.answer("Сначала создай хотя бы один шаблон сообщения.", reply_markup=templates_menu_kb())
+        return
+    await state.update_data(chat_ref=chat_ref)
+    await state.set_state(AddKeywordWatch.choosing_template)
+    rows = [
+        [InlineKeyboardButton(text=t["name"], callback_data=f"watch_tpl_{t['id']}")]
+        for t in templates
+    ]
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="menu_watches")])
+    await message.answer(
+        "3/4. Выбери шаблон для автоматического ответа:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(AddKeywordWatch.choosing_template, F.data.startswith("watch_tpl_"))
+@admin_only
+async def watch_choose_template(callback: CallbackQuery, state: FSMContext):
+    try:
+        template_id = int(callback.data.rsplit("_", 1)[-1])
+    except (TypeError, ValueError):
+        await callback.answer("Некорректный шаблон.", show_alert=True)
+        return
+    template = await db.get_template(template_id)
+    if not template:
+        await callback.answer("Шаблон не найден.", show_alert=True)
+        return
+    await state.update_data(template_id=template_id, template_name=template["name"])
+    await state.set_state(AddKeywordWatch.waiting_keywords)
+    await callback.message.edit_text(
+        "4/4. Введи ключевые слова или фразы через запятую.\n"
+        "Например: ремонт, нужна смета, ищу мастера",
+        reply_markup=_watch_cancel_kb(),
+    )
+    await callback.answer()
+
+
+@router.message(AddKeywordWatch.waiting_keywords)
+@admin_only
+async def watch_finish_add(message: Message, state: FSMContext):
+    keywords = [x.strip() for x in (message.text or "").split(",") if x.strip()]
+    if not keywords:
+        await message.answer("Нужно хотя бы одно ключевое слово.", reply_markup=_watch_cancel_kb())
+        return
+    data = await state.get_data()
+    try:
+        watch = await userbot.add_keyword_watch(
+            int(data["sender_id"]), data["chat_ref"], keywords, int(data["template_id"])
+        )
+    except Exception as e:
+        logger.warning("Не удалось добавить правило автопарсера: %s", e)
+        await message.answer(
+            f"❌ Не удалось добавить правило: {e}",
+            reply_markup=_watch_menu_kb(),
+        )
+        await state.clear()
+        return
+    await state.clear()
+    await message.answer(
+        f"✅ Правило #{watch['id']} добавлено.\n\n"
+        f"Чат: {watch['title']}\n"
+        f"Аккаунт: {data.get('sender_label', '#' + str(data['sender_id']))}\n"
+        f"Шаблон: {data.get('template_name', '#' + str(data['template_id']))}\n"
+        f"Ключи: {', '.join(watch['keywords'])}",
+        reply_markup=_watch_menu_kb(),
+    )
+
+
+async def _render_watch_list(callback: CallbackQuery):
+    rows = await db.get_monitored_chats()
+    if not rows:
+        await callback.message.edit_text("Правил пока нет.", reply_markup=_watch_menu_kb())
+        return
+    text_lines = []
+    kb_rows = []
+    for row in rows[:30]:
+        title = row.get("chat_title") or row.get("chat_ref") or str(row.get("chat_id"))
+        kws = ", ".join(row.get("keywords_list") or [])
+        text_lines.append(
+            f"#{row['id']} · {title}\n"
+            f"Аккаунт #{row['sender_account_id']} · шаблон #{row['template_id']}\n"
+            f"Ключи: {kws}"
+        )
+        kb_rows.append([
+            InlineKeyboardButton(text=f"🗑 Удалить #{row['id']} · {title[:24]}", callback_data=f"watch_del_{row['id']}")
+        ])
+    kb_rows.append([InlineKeyboardButton(text="➕ Добавить", callback_data="watch_add_start")])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_watches")])
+    await callback.message.edit_text(
+        "📋 Правила автопарсера\n\n" + "\n\n".join(text_lines[:30]),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+    )
+
+
+@router.callback_query(F.data == "watch_list_btn")
+@admin_only
+async def watch_list_button(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await _render_watch_list(callback)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("watch_del_"))
+@admin_only
+async def watch_delete_button(callback: CallbackQuery, state: FSMContext):
+    try:
+        watch_id = int(callback.data.rsplit("_", 1)[-1])
+    except (TypeError, ValueError):
+        await callback.answer("Некорректный ID.", show_alert=True)
+        return
+    deleted = await db.delete_monitored_chat(watch_id)
+    await state.clear()
+    await _render_watch_list(callback)
+    await callback.answer("Удалено" if deleted else "Правило не найдено", show_alert=not deleted)
+
+
+def _keyword_hit_label(row: dict) -> str:
+    who = f"@{row['author_username']}" if row.get("author_username") else f"id {row.get('author_telegram_id') or '—'}"
+    chat = row.get("chat_title") or f"chat {row.get('chat_id') or '—'}"
+    action_map = {
+        "sent": "✅ отправлено",
+        "send_failed": "❌ ошибка",
+        "candidate_no_consent": "🟡 найдено, без авто-DM",
+        "skipped_already_contacted": "↩️ уже был в реестре",
+    }
+    action = action_map.get(row.get("action"), row.get("action") or "—")
+    when = (row.get("created_at") or "—")[:19]
+    return f"{who} · {chat}\nКлюч: {row.get('matched_keyword') or '—'} · {action} · {when}"
+
+
+@router.callback_query(F.data == "watch_hits")
+@admin_only
+async def watch_hits(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    rows = await db.get_keyword_hits(limit=50)
+    text = "🧾 Последние совпадения автопарсера\n\n"
+    text += "\n\n".join(_keyword_hit_label(row) for row in rows) if rows else "Совпадений пока нет."
+    kb_rows = []
+    seen_ids = set()
+    for row in rows:
+        user_id = row.get("author_telegram_id")
+        if user_id is None or int(user_id) in seen_ids:
+            continue
+        seen_ids.add(int(user_id))
+        label = f"@{row['author_username']}" if row.get("author_username") else f"id {user_id}"
+        kb_rows.append([
+            InlineKeyboardButton(text=f"🔍 Проверить {label[:28]}", callback_data=f"registry_uid_{int(user_id)}")
+        ])
+        if len(kb_rows) >= 8:
+            break
+    kb_rows.append([InlineKeyboardButton(text="🔄 Обновить", callback_data="watch_hits")])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_watches")])
+    await callback.message.edit_text(
+        text[:3900],
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+    )
+    await callback.answer()
+
+
+# Старые команды оставлены как совместимый резервный способ управления.
+@router.message(Command("watch_list"))
+@admin_only
+async def cmd_watch_list(message: Message):
+    await message.answer(await _watches_text(), reply_markup=_watch_menu_kb())
+
+
+@router.message(Command("watch_add"))
+@admin_only
+async def cmd_watch_add(message: Message):
+    await message.answer("Добавление правил теперь доступно кнопкой «🔎 Автопарсер → ➕ Добавить правило».", reply_markup=_watch_menu_kb())
+
+
+@router.message(Command("watch_del"))
+@admin_only
+async def cmd_watch_del(message: Message):
+    await message.answer("Удаление правил теперь доступно кнопкой «🔎 Автопарсер → 📋 Правила».", reply_markup=_watch_menu_kb())
+
+
+def _registry_row_label(row: dict) -> str:
+    target = f"@{row['username']}" if row.get("username") else f"id {row.get('telegram_id')}"
+    source = row.get("source_chat_title") or row.get("source_kind") or "—"
+    sender = f"#{row['sender_account_id']}" if row.get("sender_account_id") else "—"
+    when = row.get("sent_at") or row.get("reserved_at") or "—"
+    return f"{target} · аккаунт {sender}\nИсточник: {source} · {row.get('status')} · {when[:19]}"
+
+
+def _registry_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔍 Проверить пользователя", callback_data="registry_check_start")],
+        [InlineKeyboardButton(text="🔄 Обновить реестр", callback_data="menu_delivery_registry")],
+        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="menu_main")],
+    ])
+
+
+@router.callback_query(F.data == "menu_delivery_registry")
+@admin_only
+async def menu_delivery_registry(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    rows = await db.get_delivery_registry(limit=50)
+    text = "📚 Единый реестр отправок\n\n"
+    text += "\n\n".join(_registry_row_label(row) for row in rows) if rows else "Реестр пока пуст."
+    text += "\n\nКнопка ниже проверяет пользователя сразу по всем аккаунтам владельца."
+    await callback.message.edit_text(text[:3900], reply_markup=_registry_menu_kb())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "registry_check_start")
+@admin_only
+async def registry_check_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(RegistryCheck.waiting_target)
+    await callback.message.edit_text(
+        "Отправь @username или Telegram ID пользователя, которого нужно проверить в общем реестре:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="menu_delivery_registry")]
+        ]),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("registry_uid_"))
+@admin_only
+async def registry_check_by_button(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    try:
+        telegram_id = int(callback.data[len("registry_uid_"):])
+    except (TypeError, ValueError):
+        await callback.answer("Некорректный пользователь.", show_alert=True)
+        return
+    rows = await db.find_deliveries(telegram_id=telegram_id, limit=20)
+    if not rows:
+        text = f"➖ Пользователя id {telegram_id} нет в общем реестре отправок."
+    else:
+        text = "✅ Этому пользователю уже отправляли сообщение.\n\n" + "\n\n".join(
+            _registry_row_label(row) for row in rows
+        )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ К совпадениям", callback_data="watch_hits")],
+        [InlineKeyboardButton(text="📚 Реестр", callback_data="menu_delivery_registry")],
+    ])
+    await callback.message.edit_text(text[:3900], reply_markup=kb)
+    await callback.answer()
+
+
+@router.message(RegistryCheck.waiting_target)
+@admin_only
+async def registry_check_finish(message: Message, state: FSMContext):
+    target = (message.text or "").strip()
+    if not target:
+        await message.answer("Укажи @username или Telegram ID.")
+        return
+    telegram_id = int(target) if target.lstrip("-").isdigit() else None
+    username = None if telegram_id is not None else target.lstrip("@").strip()
+    if telegram_id is None and not username:
+        await message.answer("Не удалось распознать пользователя. Укажи @username или числовой Telegram ID.")
+        return
+    rows = await db.find_deliveries(telegram_id=telegram_id, username=username, limit=20)
+    await state.clear()
+    if not rows:
+        text = "➖ В общем реестре отправок этого пользователя нет."
+    else:
+        text = "✅ Этому пользователю уже отправляли сообщение.\n\n" + "\n\n".join(
+            _registry_row_label(row) for row in rows
+        )
+    await message.answer(text[:3900], reply_markup=_registry_menu_kb())
+
+
+@router.message(Command("sent_registry"))
+@admin_only
+async def cmd_sent_registry(message: Message):
+    rows = await db.get_delivery_registry(limit=50)
+    text = "📚 Единый реестр отправок\n\n"
+    text += "\n\n".join(_registry_row_label(row) for row in rows) if rows else "Реестр пока пуст."
+    await message.answer(text[:3900], reply_markup=_registry_menu_kb())
+
+
+@router.message(Command("sent_check"))
+@admin_only
+async def cmd_sent_check(message: Message):
+    await message.answer("Проверка теперь доступна кнопкой «📚 Реестр отправок → 🔍 Проверить пользователя».", reply_markup=_registry_menu_kb())
