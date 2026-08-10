@@ -341,21 +341,29 @@ async def check_spambot_status(sender_id: int) -> dict:
         return {"restricted": True, "until": until, "text": text}
 
     if until and until <= now:
-        # Дата из ответа уже истекла: один раз обновляем статус, чтобы не полагаться на старое сообщение.
+        # Дата из ответа уже истекла: один раз обновляем статус. Сам по себе
+        # истёкший timestamp НЕ считаем подтверждением снятия ограничения.
         await asyncio.sleep(1.5)
         refreshed = await _spambot_query_once(client)
-        if refreshed:
-            text = refreshed
-            until = _parse_spambot_limit(text)
-            now = datetime.now(timezone.utc)
-            if until and until > now:
-                await db.set_sender_account_health(sender_id, "restricted", f"Ограничение до {until:%d.%m.%Y %H:%M UTC}")
-                return {"restricted": True, "until": until, "text": text}
+        if not refreshed:
+            return {
+                "restricted": None,
+                "until": until,
+                "text": "Срок ограничения истёк, но SpamBot не подтвердил новый статус",
+            }
+        text = refreshed
+        until = _parse_spambot_limit(text)
+        now = datetime.now(timezone.utc)
+        if until and until > now:
+            await db.set_sender_account_health(sender_id, "restricted", f"Ограничение до {until:%d.%m.%Y %H:%M UTC}")
+            return {"restricted": True, "until": until, "text": text}
 
-    if _spambot_says_clear(text) or (until is not None and until <= datetime.now(timezone.utc)):
+    if _spambot_says_clear(text):
         await db.set_sender_account_health(sender_id, "ok", None)
         return {"restricted": False, "until": until, "text": text}
 
+    # Если SpamBot снова прислал только уже истёкшую дату, не делаем вывод,
+    # что ограничение снято: ждём однозначного ответа при следующей проверке.
     return {"restricted": None, "until": until, "text": text}
 
 
@@ -1051,16 +1059,16 @@ async def send_to_employee_detailed(
         return True, None, None
     except Exception as exc:
         kind, error = _classify_send_exception(exc)
-        if kind == "technical" and posts_sent:
-            kind = "technical_partial"
+        if posts_sent and kind in {"technical", "restriction"}:
+            kind = "technical_partial" if kind == "technical" else "restriction_partial"
             error = (
-                f"Технический сбой после отправки части шаблона ({posts_sent} сообщ.). "
-                f"Автоповтор отключён во избежание дубля. {error}"
+                f"Сбой после отправки части шаблона ({posts_sent} сообщ.). "
+                f"Автоповтор этого получателя отключён во избежание дубля. {error}"
             )
         if sender_id is not None:
             if kind in {"technical", "technical_partial"}:
                 await db.set_sender_account_health(int(sender_id), "technical_error", error)
-            elif kind == "restriction":
+            elif kind in {"restriction", "restriction_partial"}:
                 await db.set_sender_account_health(int(sender_id), "restricted", error)
         return False, error, kind
 
@@ -1385,7 +1393,9 @@ async def broadcast(
         await db.finish_delivery(
             telegram_id=employee.get("telegram_id"),
             username=employee.get("username"),
-            success=ok,
+            # Если часть шаблона уже ушла, считаем получателя обработанным
+            # в общем реестре, чтобы будущая рассылка не продублировала начало.
+            success=ok or error_kind in {"technical_partial", "restriction_partial"},
             error=error,
         )
         status = "sent" if ok else "failed"
@@ -1486,6 +1496,48 @@ async def broadcast(
                     if await _wait_while_paused(stop_event, pause_event):
                         stopped_sender_ids.add(sender_id)
                         break
+                    continue
+
+                if status == "failed" and error_kind == "restriction_partial":
+                    # Часть шаблона уже отправлена: текущего адресата не повторяем,
+                    # но всю рассылку ставим на паузу до подтверждения снятия ограничения.
+                    await record_final(sender_id, job, status, error)
+                    await db.set_broadcast_run_paused(run_id, f"restriction:{error or 'restriction_partial'}", sender_id)
+                    async with _active_broadcast_lock:
+                        _restriction_sender_for_run[run_id] = sender_id
+                        for active_sender_id in effective_sender_ids:
+                            _restricted_run_by_sender[active_sender_id] = run_id
+                    for active_pause_event in pause_events.values():
+                        active_pause_event.set()
+                    if progress_callback:
+                        await progress_callback({
+                            "total": total,
+                            "processed": processed,
+                            "sent": sent,
+                            "failed": failed,
+                            "skipped": skipped,
+                            "templates_used": len(used_template_ids),
+                            "current": employee,
+                            "ok": False,
+                            "status": "paused_restriction",
+                            "error": error,
+                            "sender_id": sender_id,
+                            "sender_account_id": sender_id,
+                            "sender_owner_id": int(configured_by_id[sender_id]["owner_id"]),
+                            "stopped_accounts": sorted(stopped_sender_ids),
+                            "paused_accounts": sorted(effective_sender_ids),
+                            "technical_disabled_accounts": sorted(technical_disabled_sender_ids),
+                            "failover_count": failover_count,
+                            "auto_switch_technical": auto_switch_technical,
+                            "run_id": run_id,
+                            "restriction_sender_id": sender_id,
+                            "pause_reason": error,
+                            "skip_chat_title": skip_chat_title,
+                        })
+                    if await _wait_while_paused(stop_event, pause_event):
+                        stopped_sender_ids.add(sender_id)
+                        break
+                    index += 1
                     continue
 
                 if status == "failed" and error_kind == "technical_partial":
@@ -1685,12 +1737,18 @@ async def resume_broadcast_run(
                     continue
                 ok, error, kind = await send_to_employee_detailed(employee, template, sender_id=sender_id)
                 await db.finish_delivery(
-                    telegram_id=employee.get("telegram_id"), username=employee.get("username"), success=ok, error=error,
+                    telegram_id=employee.get("telegram_id"), username=employee.get("username"),
+                    success=ok or kind in {"technical_partial", "restriction_partial"}, error=error,
                 )
                 if ok:
                     status = "sent"; sent_now += 1
-                elif kind == "restriction":
-                    await db.update_broadcast_run_item(run_id, int(item["position"]), sender_account_id=sender_id, status="pending", error=error)
+                elif kind in {"restriction", "restriction_partial"}:
+                    if kind == "restriction_partial":
+                        # Не повторяем адресата, которому уже ушла часть шаблона.
+                        await db.update_broadcast_run_item(run_id, int(item["position"]), sender_account_id=sender_id, status="failed", error=error)
+                        failed_now += 1
+                    else:
+                        await db.update_broadcast_run_item(run_id, int(item["position"]), sender_account_id=sender_id, status="pending", error=error)
                     await db.set_broadcast_run_paused(run_id, f"restriction:{error or 'restriction'}", sender_id)
                     async with _active_broadcast_lock:
                         _restriction_sender_for_run[run_id] = sender_id

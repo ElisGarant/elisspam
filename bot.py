@@ -10,6 +10,7 @@ import io
 import inspect
 import logging
 import re
+from datetime import datetime, timezone
 from urllib.parse import urlparse
 
 from aiogram import Bot, Dispatcher, Router, F
@@ -1986,6 +1987,54 @@ async def broadcast_check_and_resume(callback: CallbackQuery):
     if run.get("status") not in {"paused", "running"}:
         await callback.answer("Эта рассылка уже завершена.", show_alert=True)
         return
+
+    pause_reason = str(run.get("pause_reason") or "")
+    flood_match = re.search(r"FloodWait:.*?(\d+)\s*сек", pause_reason, re.IGNORECASE)
+    if flood_match:
+        # FloodWait — это точный серверный таймер Telegram, SpamBot здесь не нужен.
+        wait_seconds = int(flood_match.group(1))
+        paused_at_raw = run.get("paused_at")
+        elapsed = 0.0
+        if paused_at_raw:
+            try:
+                paused_at = datetime.fromisoformat(str(paused_at_raw))
+                if paused_at.tzinfo is None:
+                    paused_at = paused_at.replace(tzinfo=timezone.utc)
+                elapsed = max(0.0, (datetime.now(timezone.utc) - paused_at).total_seconds())
+            except ValueError:
+                elapsed = 0.0
+        remaining = max(0, int(wait_seconds - elapsed + 0.999))
+        if remaining > 0:
+            await callback.answer(f"⏳ Нужно подождать ещё {remaining} сек.", show_alert=True)
+            return
+
+        await callback.answer("✅ FloodWait закончился. Продолжаю...")
+        active_run_id = await userbot.get_restriction_run_for_sender(sender_id)
+        if active_run_id == run_id:
+            await userbot.release_restriction_pause(run_id)
+            await callback.message.answer(
+                "✅ Таймер FloodWait закончился.\n▶️ Продолжаю сохранённую очередь с текущего места.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="📋 Результаты", callback_data=f"bcast_results_{run_id}")]
+                ]),
+            )
+            return
+        try:
+            result_run = await userbot.resume_broadcast_run(run_id)
+        except ValueError as exc:
+            await callback.message.answer(f"⚠️ Не удалось продолжить: {exc}")
+            return
+        await callback.message.answer(
+            f"✅ Таймер FloodWait закончился. Очередь восстановлена.\n"
+            f"Отправлено: {result_run.get('sent', 0)}\n"
+            f"Ошибок: {result_run.get('failed', 0)}\n"
+            f"Осталось: {result_run.get('pending', 0)}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📋 Результаты", callback_data=f"bcast_results_{run_id}")]
+            ]),
+        )
+        return
+
     await callback.answer("🔄 Проверяю статус аккаунта...")
     try:
         result = await userbot.check_spambot_status(sender_id)

@@ -1,0 +1,12 @@
+Release verification:
+- Python 3.10 parser: OK
+- Python 3.11 parser: OK
+- py_compile all .py: OK
+- compileall: OK
+- FSM state references: OK
+- duplicate handler decorators: none
+- project module call references: OK
+- SQLite fresh schema: OK
+- SQLite legacy migration: OK
+- broadcast checkpoint recovery: OK
+- fixed bot.py line 1313 for Python <=3.11 compatible f-string syntax
