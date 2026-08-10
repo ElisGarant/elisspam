@@ -1307,11 +1307,13 @@ async def _active_broadcast_accounts_for_current_owner() -> list[dict]:
     labels = _account_label_map(accounts)
     result = []
     for account in accounts:
+        account_id = int(account["id"])
         health_icon, health_text = _account_health_text(account)
+        label = labels.get(account_id, f"id {account_id}")
         result.append({
-            "id": int(account["id"]),
-            "label": f"{health_icon} {labels.get(int(account['id']), f'id {account['id']}')}",
-            "paused": int(account["id"]) in paused_account_ids,
+            "id": account_id,
+            "label": f"{health_icon} {label}",
+            "paused": account_id in paused_account_ids,
             "health_status": account.get("health_status") or "unknown",
             "health_text": health_text,
         })
