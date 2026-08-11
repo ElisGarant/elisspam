@@ -1673,10 +1673,10 @@ async def delete_monitored_chat(watch_id: int) -> bool:
 async def add_keyword_hit(*, monitored_chat_id: int, sender_account_id: int,
                           chat_id: int | None, chat_title: str | None, message_id: int | None,
                           author_telegram_id: int | None, author_username: str | None,
-                          matched_keyword: str | None, action: str, details: str | None = None):
+                          matched_keyword: str | None, action: str, details: str | None = None) -> bool:
     owner_id = get_current_owner_id()
     async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute(
+        cursor = await db.execute(
             """INSERT OR IGNORE INTO keyword_hits
                (owner_id, monitored_chat_id, sender_account_id, chat_id, chat_title,
                 message_id, author_telegram_id, author_username, matched_keyword,
@@ -1687,6 +1687,7 @@ async def add_keyword_hit(*, monitored_chat_id: int, sender_account_id: int,
              matched_keyword, action, details, datetime.utcnow().isoformat()),
         )
         await db.commit()
+        return cursor.rowcount > 0
 
 
 async def get_keyword_hits(limit: int = 100) -> list[dict]:

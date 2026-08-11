@@ -16,7 +16,7 @@ import os
 import random
 import re
 import struct
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Awaitable, Callable
 import zlib
 
@@ -682,14 +682,68 @@ def _entity_title(entity, fallback: str) -> str:
     return fallback
 
 
-async def _resolve_required_chat_entity(client: TelegramClient, chat_link_or_id: str, sender_id: int):
+def _chat_access_error_text(exc: Exception) -> str:
+    """Делает RPC-ошибки invite-ссылок понятными и безопасными для интерфейса."""
+    name = type(exc).__name__
+    text = str(exc or "").lower()
+    if name in {"InviteHashExpiredError", "InviteHashInvalidError"} or (
+        "checkchatinviterequest" in text and ("expired" in text or "not valid" in text or "invalid" in text)
+    ):
+        return "Ссылка-приглашение истекла или недействительна"
+    if name in {"InviteRequestSentError"}:
+        return "Для входа в чат требуется одобрение заявки"
+    if name in {"ChannelPrivateError", "ChatAdminRequiredError"}:
+        return "Аккаунт не имеет доступа к этому чату"
+    if name in {"UserNotParticipantError", "ChannelParicipantMissingError"}:
+        return "Аккаунт должен состоять в этом чате"
+    return f"{name}: {exc}"
+
+
+async def _find_dialog_entity_by_peer_id(client: TelegramClient, chat_id: int):
+    """Ищет уже доступный чат в диалогах по сохранённому peer id."""
+    try:
+        async for dialog in client.iter_dialogs():
+            entity = getattr(dialog, "entity", None)
+            if entity is not None and int(utils.get_peer_id(entity)) == int(chat_id):
+                return entity
+    except Exception:
+        logger.debug("Не удалось перебрать диалоги для chat_id=%s", chat_id, exc_info=True)
+    return None
+
+
+async def _resolve_chat_entity(
+    client: TelegramClient,
+    chat_link_or_id: str,
+    *,
+    fallback_chat_id: int | None = None,
+):
+    """
+    Разрешает чат без автоматического вступления. Для сохранённого правила сначала
+    использует chat_id/диалоги, поэтому истёкшая старая invite-ссылка не мешает
+    работе, если аккаунт уже состоит в чате.
+    """
+    if fallback_chat_id is not None:
+        try:
+            return await client.get_entity(int(fallback_chat_id))
+        except Exception:
+            entity = await _find_dialog_entity_by_peer_id(client, int(fallback_chat_id))
+            if entity is not None:
+                return entity
+
     chat_ref = _normalize_chat_ref(chat_link_or_id)
     try:
-        entity = await client.get_entity(chat_ref)
-    except (ChannelInvalidError, ChannelPrivateError, ValueError) as e:
+        return await client.get_entity(chat_ref)
+    except (ChannelInvalidError, ChannelPrivateError, ValueError, RPCError) as exc:
+        raise ValueError(_chat_access_error_text(exc)) from exc
+
+
+async def _resolve_required_chat_entity(client: TelegramClient, chat_link_or_id: str, sender_id: int):
+    try:
+        entity = await _resolve_chat_entity(client, chat_link_or_id)
+    except ValueError as e:
         raise ValueError(
-            f"Аккаунт #{sender_id} не может открыть этот чат. "
-            "Проверь ссылку/id и добавь юзербот в чат."
+            f"Аккаунт #{sender_id} не может открыть этот чат: {e}. "
+            "Проверь ссылку/id и убедись, что аккаунт уже состоит в чате."
         ) from e
 
     try:
@@ -870,8 +924,105 @@ async def _send_template_post_via_inline(client: TelegramClient, entity, post: d
 
 
 
-async def add_keyword_watch(sender_id: int, chat_ref: str, keywords: list[str], template_id: int) -> dict:
-    """Добавляет чат для наблюдения. Авто-DM разрешён только после предыдущего входящего ЛС от пользователя."""
+async def list_available_watch_chats(sender_id: int, *, limit: int = 200) -> list[dict]:
+    """Возвращает группы/каналы, уже доступные выбранному аккаунту.
+
+    Это основной безопасный способ выбрать приватный чат, если старая invite-ссылка
+    уже истекла: Telegram не позволяет восстановить chat_id из просроченного invite hash,
+    зато уже доступный чат можно взять напрямую из списка диалогов аккаунта.
+    """
+    account = await db.get_sender_account(int(sender_id), include_inactive=False)
+    if not account:
+        raise ValueError("Аккаунт отправки не найден")
+    owner_id = db.get_current_owner_id()
+    if int(account["owner_id"]) != int(owner_id) and not db.is_root_admin(owner_id):
+        raise ValueError("Нет доступа к этому аккаунту")
+    if not await is_authorized(sender_id):
+        raise ValueError("Аккаунт не авторизован")
+
+    client = await _get_client(sender_id)
+    rows: list[dict] = []
+    seen: set[int] = set()
+    try:
+        async for dialog in client.iter_dialogs(limit=max(1, min(int(limit), 500))):
+            if not (getattr(dialog, "is_group", False) or getattr(dialog, "is_channel", False)):
+                continue
+            entity = getattr(dialog, "entity", None)
+            if entity is None:
+                continue
+            try:
+                chat_id = int(utils.get_peer_id(entity))
+            except Exception:
+                continue
+            if chat_id in seen:
+                continue
+            seen.add(chat_id)
+            title = _entity_title(entity, str(getattr(dialog, "name", None) or chat_id))
+            username = getattr(entity, "username", None)
+            ref = f"@{username}" if username else str(chat_id)
+            rows.append({
+                "chat_id": chat_id,
+                "title": title,
+                "ref": ref,
+                "username": username,
+            })
+    except Exception as exc:
+        raise ValueError(f"Не удалось получить список чатов аккаунта: {exc}") from exc
+
+    rows.sort(key=lambda x: (str(x.get("title") or "").casefold(), int(x["chat_id"])))
+    return rows
+
+
+async def resolve_keyword_watch_chats(sender_id: int, chat_refs: list[str]) -> dict:
+    """Проверяет список чатов выбранным аккаунтом без записи правил в БД."""
+    account = await db.get_sender_account(int(sender_id), include_inactive=False)
+    if not account:
+        raise ValueError("Аккаунт отправки не найден")
+    owner_id = db.get_current_owner_id()
+    if int(account["owner_id"]) != int(owner_id) and not db.is_root_admin(owner_id):
+        raise ValueError("Нет доступа к этому аккаунту")
+    if not await is_authorized(sender_id):
+        raise ValueError("Аккаунт не авторизован")
+
+    client = await _get_client(sender_id)
+    resolved: list[dict] = []
+    errors: list[dict] = []
+    seen_chat_ids: set[int] = set()
+    for raw_ref in chat_refs:
+        ref = str(raw_ref or "").strip()
+        if not ref:
+            continue
+        try:
+            entity = await _resolve_chat_entity(client, ref)
+            chat_id = int(utils.get_peer_id(entity))
+            if chat_id in seen_chat_ids:
+                continue
+            seen_chat_ids.add(chat_id)
+            resolved.append({
+                "ref": ref,
+                "chat_id": chat_id,
+                "title": _entity_title(entity, ref),
+            })
+        except Exception as exc:
+            error_text = str(exc) if isinstance(exc, ValueError) else _chat_access_error_text(exc)
+            errors.append({"ref": ref, "error": error_text})
+    return {"resolved": resolved, "errors": errors}
+
+
+async def add_keyword_watches(
+    sender_id: int,
+    chat_refs: list[str],
+    keywords: list[str],
+    template_id: int,
+    *,
+    resolved_chats: list[dict] | None = None,
+) -> dict:
+    """Массово добавляет правила для нескольких чатов с общим набором ключей.
+
+    Если ``resolved_chats`` передан после предпросмотра, повторно invite-ссылки
+    не открываются. Это важно для одноразовых/успевших истечь приватных ссылок:
+    после успешного preview правило сохраняется по уже известному chat_id.
+    """
     account = await db.get_sender_account(int(sender_id), include_inactive=False)
     if not account:
         raise ValueError("Аккаунт отправки не найден")
@@ -883,15 +1034,170 @@ async def add_keyword_watch(sender_id: int, chat_ref: str, keywords: list[str], 
     template = await db.get_template(int(template_id))
     if not template:
         raise ValueError("Шаблон не найден")
+
+    cleaned_keywords: list[str] = []
+    seen_keywords: set[str] = set()
+    for keyword in keywords:
+        value = str(keyword or "").strip().lower()
+        if not value or value in seen_keywords:
+            continue
+        seen_keywords.add(value)
+        cleaned_keywords.append(value)
+    if not cleaned_keywords:
+        raise ValueError("Нужно хотя бы одно ключевое слово")
+
+    if resolved_chats is None:
+        preview = await resolve_keyword_watch_chats(sender_id, chat_refs)
+    else:
+        preview = {"resolved": [], "errors": []}
+        seen_ids: set[int] = set()
+        for item in resolved_chats:
+            try:
+                chat_id = int(item["chat_id"])
+                ref = str(item.get("ref") or chat_id).strip()
+                title = str(item.get("title") or ref).strip()
+            except (KeyError, TypeError, ValueError):
+                continue
+            if chat_id in seen_ids:
+                continue
+            seen_ids.add(chat_id)
+            preview["resolved"].append({"ref": ref, "chat_id": chat_id, "title": title})
+
+    existing = await db.get_monitored_chats(sender_account_id=int(sender_id))
+    existing_keys = {
+        (
+            int(row.get("chat_id") or 0),
+            int(row.get("template_id") or 0),
+            frozenset(row.get("keywords_list") or []),
+        )
+        for row in existing
+    }
+
+    added: list[dict] = []
+    skipped_existing: list[dict] = []
+    for item in preview["resolved"]:
+        key = (int(item["chat_id"]), int(template_id), frozenset(cleaned_keywords))
+        if key in existing_keys:
+            skipped_existing.append(item)
+            continue
+        watch_id = await db.add_monitored_chat(
+            int(sender_id), item["ref"], int(item["chat_id"]), item["title"], cleaned_keywords, int(template_id)
+        )
+        added.append({**item, "id": watch_id})
+        existing_keys.add(key)
+
     client = await _get_client(sender_id)
-    entity = await client.get_entity(_normalize_chat_ref(chat_ref))
-    chat_id = int(utils.get_peer_id(entity))
-    title = _entity_title(entity, str(chat_ref).strip())
-    watch_id = await db.add_monitored_chat(
-        int(sender_id), str(chat_ref).strip(), chat_id, title, keywords, int(template_id)
-    )
     _register_keyword_handler(client, int(sender_id), int(account["owner_id"]))
-    return {"id": watch_id, "chat_id": chat_id, "title": title, "keywords": keywords, "template_id": int(template_id)}
+    return {
+        "added": added,
+        "skipped_existing": skipped_existing,
+        "errors": preview["errors"],
+        "keywords": cleaned_keywords,
+        "template_id": int(template_id),
+    }
+
+
+async def add_keyword_watch(sender_id: int, chat_ref: str, keywords: list[str], template_id: int) -> dict:
+    """Совместимый одиночный вариант поверх массового добавления."""
+    result = await add_keyword_watches(sender_id, [chat_ref], keywords, template_id)
+    if result["added"]:
+        item = result["added"][0]
+        return {
+            "id": item["id"],
+            "chat_id": item["chat_id"],
+            "title": item["title"],
+            "keywords": result["keywords"],
+            "template_id": int(template_id),
+        }
+    if result["skipped_existing"]:
+        raise ValueError("Такое правило уже существует")
+    if result["errors"]:
+        raise ValueError(result["errors"][0]["error"])
+    raise ValueError("Не удалось добавить правило")
+
+
+async def scan_keyword_watch_history(watch_id: int, *, limit: int | None = None, days: int | None = None) -> dict:
+    """Сканирует историю одного правила. Только журналирует совпадения, без отправки сообщений."""
+    watches = await db.get_monitored_chats(enabled_only=False)
+    watch = next((row for row in watches if int(row["id"]) == int(watch_id)), None)
+    if not watch:
+        raise ValueError("Правило не найдено")
+
+    sender_id = int(watch["sender_account_id"])
+    account = await db.get_sender_account(sender_id, include_inactive=False)
+    if not account:
+        raise ValueError("Аккаунт отправки не найден")
+    owner_id = db.get_current_owner_id()
+    if int(account["owner_id"]) != int(owner_id) and not db.is_root_admin(owner_id):
+        raise ValueError("Нет доступа к этому аккаунту")
+    if not await is_authorized(sender_id):
+        raise ValueError("Аккаунт не авторизован")
+
+    client = await _get_client(sender_id)
+    entity = await _resolve_chat_entity(
+        client,
+        watch["chat_ref"],
+        fallback_chat_id=int(watch["chat_id"]) if watch.get("chat_id") is not None else None,
+    )
+    me = await client.get_me()
+    chat_id = int(utils.get_peer_id(entity))
+    title = _entity_title(entity, watch.get("chat_title") or watch.get("chat_ref") or str(chat_id))
+    keywords = [kw.lower() for kw in (watch.get("keywords_list") or []) if kw]
+    if not keywords:
+        raise ValueError("У правила нет ключевых слов")
+
+    scan_limit = int(limit) if limit is not None else 10000
+    if scan_limit <= 0:
+        raise ValueError("Лимит должен быть положительным")
+    scan_limit = min(scan_limit, 10000)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=int(days)) if days is not None else None
+
+    stats = {"scanned": 0, "matched": 0, "added": 0, "errors": 0, "title": title}
+    async for message in client.iter_messages(entity, limit=scan_limit):
+        msg_date = getattr(message, "date", None)
+        if cutoff is not None and msg_date is not None:
+            if msg_date.tzinfo is None:
+                msg_date = msg_date.replace(tzinfo=timezone.utc)
+            if msg_date < cutoff:
+                break
+
+        stats["scanned"] += 1
+        text = (getattr(message, "message", None) or getattr(message, "raw_text", None) or "").lower()
+        if not text:
+            continue
+        matched = next((kw for kw in keywords if kw in text), None)
+        if not matched:
+            continue
+        stats["matched"] += 1
+
+        try:
+            author = await message.get_sender()
+            if not isinstance(author, types.User) or getattr(author, "bot", False):
+                continue
+            author_id = getattr(author, "id", None)
+            if not author_id or int(author_id) == int(me.id):
+                continue
+            username = getattr(author, "username", None)
+            already = await db.has_delivery(telegram_id=int(author_id), username=username)
+            inserted = await db.add_keyword_hit(
+                monitored_chat_id=int(watch["id"]),
+                sender_account_id=sender_id,
+                chat_id=chat_id,
+                chat_title=title,
+                message_id=getattr(message, "id", None),
+                author_telegram_id=int(author_id),
+                author_username=username,
+                matched_keyword=matched,
+                action="history_already_contacted" if already else "history_candidate",
+                details="Исторический скан: сообщение только сохранено в журнал, авто-DM отключён",
+            )
+            if inserted:
+                stats["added"] += 1
+        except Exception as exc:
+            stats["errors"] += 1
+            logger.debug("Не удалось обработать историческое сообщение %s/%s: %s", chat_id, getattr(message, "id", None), exc)
+
+    return stats
 
 
 async def _has_prior_private_interaction(client: TelegramClient, user_entity) -> bool:
@@ -1781,7 +2087,10 @@ async def import_group_members(group_link_or_id: str) -> list[dict]:
         raise ValueError("Юзербот не авторизован")
 
     client = await _get_client()
-    entity = await client.get_entity(group_link_or_id)
+    try:
+        entity = await _resolve_chat_entity(client, group_link_or_id)
+    except ValueError as exc:
+        raise ValueError(f"Не удалось открыть группу: {exc}") from exc
     participants = await client.get_participants(entity)
     result = []
     for p in participants:

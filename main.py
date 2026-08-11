@@ -13,6 +13,7 @@
 """
 import asyncio
 import logging
+from pathlib import Path
 
 import database as db
 import userbot
@@ -21,9 +22,12 @@ from scheduler import scheduler_loop
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("main")
+BUILD_VERSION = (Path(__file__).with_name("BUILD.txt").read_text(encoding="utf-8").strip()
+                 if Path(__file__).with_name("BUILD.txt").exists() else "unknown")
 
 
 async def main():
+    logger.info("Сборка: %s", BUILD_VERSION)
     await db.init_db()
     logger.info("База данных готова.")
 

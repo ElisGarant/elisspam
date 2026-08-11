@@ -168,8 +168,10 @@ class AccessAdmin(StatesGroup):
 class AddKeywordWatch(StatesGroup):
     choosing_account = State()
     waiting_chat = State()
+    choosing_dialogs = State()
     choosing_template = State()
     waiting_keywords = State()
+    confirming = State()
 
 
 class RegistryCheck(StatesGroup):
@@ -2878,11 +2880,29 @@ def build_bot_and_dispatcher() -> tuple[Bot, Dispatcher]:
 
 def _watch_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить правило", callback_data="watch_add_start")],
+        [InlineKeyboardButton(text="➕ Добавить чаты/ключи списком", callback_data="watch_add_start")],
+        [InlineKeyboardButton(text="📚 Просканировать историю", callback_data="watch_history_start")],
         [InlineKeyboardButton(text="📋 Правила", callback_data="watch_list_btn")],
         [InlineKeyboardButton(text="🧾 Найденные совпадения", callback_data="watch_hits")],
         [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="menu_main")],
     ])
+
+
+def _split_list_input(text: str | None, *, lower: bool = False) -> list[str]:
+    """Разбирает список из строк/запятых/точек с запятой и удаляет дубли с сохранением порядка."""
+    raw_items = re.split(r"[\n,;]+", text or "")
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_items:
+        item = raw.strip()
+        if not item:
+            continue
+        key = item.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(item.lower() if lower else item)
+    return result
 
 
 def _watch_cancel_kb() -> InlineKeyboardMarkup:
@@ -2964,29 +2984,32 @@ async def watch_choose_account(callback: CallbackQuery, state: FSMContext):
     if not account:
         await callback.answer("Аккаунт недоступен.", show_alert=True)
         return
-    await state.update_data(sender_id=sender_id, sender_label=account["label"])
+    await state.update_data(sender_id=sender_id, sender_label=account["label"], resolved_chats=None)
     await state.set_state(AddKeywordWatch.waiting_chat)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Выбрать из доступных чатов", callback_data="watch_pick_dialogs")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="menu_watches")],
+    ])
     await callback.message.edit_text(
-        "2/4. Отправь ссылку, @username или ID чата/группы/канала, за которым нужно следить.\n\n"
+        "2/4. Выбери способ добавления чатов.\n\n"
+        "Можно сразу отправить один или несколько чатов списком — по одному на строку "
+        "или через запятую/точку с запятой. Поддерживаются t.me-ссылки, @username и ID.\n\n"
+        "Для приватного чата со старой/истёкшей invite-ссылкой нажми "
+        "«📋 Выбрать из доступных чатов»: бот возьмёт chat_id прямо из диалогов аккаунта.\n\n"
+        "Пример:\n@chat_one\nhttps://t.me/chat_two\n-1001234567890\n\n"
         f"Аккаунт: {account['label']}",
-        reply_markup=_watch_cancel_kb(),
+        reply_markup=kb,
     )
     await callback.answer()
 
 
-@router.message(AddKeywordWatch.waiting_chat)
-@admin_only
-async def watch_receive_chat(message: Message, state: FSMContext):
-    chat_ref = (message.text or "").strip()
-    if not chat_ref:
-        await message.answer("Укажи ссылку, @username или ID чата.", reply_markup=_watch_cancel_kb())
-        return
+
+async def _watch_send_template_picker(message: Message, state: FSMContext, chat_count: int):
     templates = await db.get_templates()
     if not templates:
         await state.clear()
         await message.answer("Сначала создай хотя бы один шаблон сообщения.", reply_markup=templates_menu_kb())
         return
-    await state.update_data(chat_ref=chat_ref)
     await state.set_state(AddKeywordWatch.choosing_template)
     rows = [
         [InlineKeyboardButton(text=t["name"], callback_data=f"watch_tpl_{t['id']}")]
@@ -2994,9 +3017,175 @@ async def watch_receive_chat(message: Message, state: FSMContext):
     ]
     rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="menu_watches")])
     await message.answer(
-        "3/4. Выбери шаблон для автоматического ответа:",
+        f"3/4. Выбрано чатов: {chat_count}. Выбери шаблон для live-автоответа:\n"
+        "(исторический скан сообщения не отправляет)",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
     )
+
+
+def _watch_dialog_picker_kb(dialogs: list[dict], selected: set[int], page: int = 0, *, page_size: int = 8):
+    total = len(dialogs)
+    pages = max(1, (total + page_size - 1) // page_size)
+    page = max(0, min(page, pages - 1))
+    start = page * page_size
+    chunk = dialogs[start:start + page_size]
+    rows: list[list[InlineKeyboardButton]] = []
+    for index, item in enumerate(chunk, start=start):
+        mark = "✅" if index in selected else "◻️"
+        title = str(item.get("title") or item.get("ref") or item.get("chat_id"))
+        if len(title) > 42:
+            title = title[:39] + "…"
+        rows.append([
+            InlineKeyboardButton(text=f"{mark} {title}", callback_data=f"watch_dlg_toggle_{index}")
+        ])
+    nav: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"watch_dlg_page_{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{pages}", callback_data="watch_dlg_noop"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"watch_dlg_page_{page + 1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton(text=f"✅ Готово ({len(selected)})", callback_data="watch_dlg_done")])
+    rows.append([InlineKeyboardButton(text="↩️ Ввести списком", callback_data="watch_dlg_manual")])
+    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="menu_watches")])
+    return InlineKeyboardMarkup(inline_keyboard=rows), page
+
+
+async def _watch_render_dialog_picker(callback: CallbackQuery, state: FSMContext, *, page: int | None = None):
+    data = await state.get_data()
+    dialogs = data.get("watch_dialogs") or []
+    selected = {int(x) for x in (data.get("watch_dialog_selected") or [])}
+    current_page = int(data.get("watch_dialog_page") or 0) if page is None else int(page)
+    kb, current_page = _watch_dialog_picker_kb(dialogs, selected, current_page)
+    await state.update_data(watch_dialog_page=current_page, watch_dialog_selected=sorted(selected))
+    await callback.message.edit_text(
+        "📋 Выбери один или несколько чатов, в которых этот аккаунт уже состоит.\n\n"
+        "Этот способ работает и для приватных чатов, даже если старая invite-ссылка уже истекла.\n"
+        f"Найдено доступных групп/каналов: {len(dialogs)}\n"
+        f"Выбрано: {len(selected)}",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(AddKeywordWatch.waiting_chat, F.data == "watch_pick_dialogs")
+@router.callback_query(AddKeywordWatch.waiting_chat, F.data == "watch_pick_dialogs_from_error")
+@admin_only
+async def watch_pick_dialogs(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    try:
+        dialogs = await userbot.list_available_watch_chats(int(data["sender_id"]), limit=200)
+    except Exception as exc:
+        await callback.answer("Не удалось получить список чатов", show_alert=True)
+        await callback.message.edit_text(
+            f"❌ Не удалось получить список доступных чатов: {exc}",
+            reply_markup=_watch_cancel_kb(),
+        )
+        return
+    if not dialogs:
+        await callback.answer("У аккаунта нет доступных групп/каналов", show_alert=True)
+        return
+    await state.update_data(watch_dialogs=dialogs, watch_dialog_selected=[], watch_dialog_page=0)
+    await state.set_state(AddKeywordWatch.choosing_dialogs)
+    await _watch_render_dialog_picker(callback, state, page=0)
+    await callback.answer()
+
+
+@router.callback_query(AddKeywordWatch.choosing_dialogs, F.data == "watch_dlg_noop")
+@admin_only
+async def watch_dialog_noop(callback: CallbackQuery):
+    await callback.answer()
+
+
+@router.callback_query(AddKeywordWatch.choosing_dialogs, F.data.startswith("watch_dlg_page_"))
+@admin_only
+async def watch_dialog_page(callback: CallbackQuery, state: FSMContext):
+    try:
+        page = int(callback.data.rsplit("_", 1)[-1])
+    except (TypeError, ValueError):
+        page = 0
+    await _watch_render_dialog_picker(callback, state, page=page)
+    await callback.answer()
+
+
+@router.callback_query(AddKeywordWatch.choosing_dialogs, F.data.startswith("watch_dlg_toggle_"))
+@admin_only
+async def watch_dialog_toggle(callback: CallbackQuery, state: FSMContext):
+    try:
+        index = int(callback.data.rsplit("_", 1)[-1])
+    except (TypeError, ValueError):
+        await callback.answer("Некорректный чат", show_alert=True)
+        return
+    data = await state.get_data()
+    dialogs = data.get("watch_dialogs") or []
+    if index < 0 or index >= len(dialogs):
+        await callback.answer("Чат больше недоступен", show_alert=True)
+        return
+    selected = {int(x) for x in (data.get("watch_dialog_selected") or [])}
+    if index in selected:
+        selected.remove(index)
+    else:
+        if len(selected) >= 50:
+            await callback.answer("За один раз можно выбрать до 50 чатов", show_alert=True)
+            return
+        selected.add(index)
+    await state.update_data(watch_dialog_selected=sorted(selected))
+    await _watch_render_dialog_picker(callback, state)
+    await callback.answer()
+
+
+@router.callback_query(AddKeywordWatch.choosing_dialogs, F.data == "watch_dlg_manual")
+@admin_only
+async def watch_dialog_manual(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(watch_dialogs=None, watch_dialog_selected=None, resolved_chats=None)
+    await state.set_state(AddKeywordWatch.waiting_chat)
+    await callback.message.edit_text(
+        "Отправь один или несколько чатов списком: @username, t.me-ссылка или ID.\n"
+        "Можно по одному на строку или через запятую/точку с запятой.",
+        reply_markup=_watch_cancel_kb(),
+    )
+    await callback.answer()
+
+
+@router.callback_query(AddKeywordWatch.choosing_dialogs, F.data == "watch_dlg_done")
+@admin_only
+async def watch_dialog_done(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    dialogs = data.get("watch_dialogs") or []
+    selected = sorted({int(x) for x in (data.get("watch_dialog_selected") or [])})
+    if not selected:
+        await callback.answer("Выбери хотя бы один чат", show_alert=True)
+        return
+    chosen = [dialogs[i] for i in selected if 0 <= i < len(dialogs)]
+    resolved = [
+        {"ref": str(x.get("ref") or x["chat_id"]), "chat_id": int(x["chat_id"]), "title": str(x.get("title") or x["chat_id"])}
+        for x in chosen
+    ]
+    await state.update_data(
+        chat_refs=[x["ref"] for x in resolved],
+        resolved_chats=resolved,
+        watch_dialogs=None,
+        watch_dialog_selected=None,
+    )
+    await callback.message.edit_text(
+        "✅ Чаты выбраны:\n" + "\n".join(f"• {x['title']}" for x in resolved[:20]) +
+        (f"\n… и ещё {len(resolved) - 20}" if len(resolved) > 20 else "")
+    )
+    await _watch_send_template_picker(callback.message, state, len(resolved))
+    await callback.answer()
+
+
+@router.message(AddKeywordWatch.waiting_chat)
+@admin_only
+async def watch_receive_chat(message: Message, state: FSMContext):
+    chat_refs = _split_list_input(message.text)
+    if not chat_refs:
+        await message.answer("Укажи хотя бы один чат: ссылка, @username или ID.", reply_markup=_watch_cancel_kb())
+        return
+    if len(chat_refs) > 50:
+        await message.answer("За один раз можно добавить до 50 чатов. Сократи список.", reply_markup=_watch_cancel_kb())
+        return
+    await state.update_data(chat_refs=chat_refs, resolved_chats=None)
+    await _watch_send_template_picker(message, state, len(chat_refs))
 
 
 @router.callback_query(AddKeywordWatch.choosing_template, F.data.startswith("watch_tpl_"))
@@ -3014,8 +3203,9 @@ async def watch_choose_template(callback: CallbackQuery, state: FSMContext):
     await state.update_data(template_id=template_id, template_name=template["name"])
     await state.set_state(AddKeywordWatch.waiting_keywords)
     await callback.message.edit_text(
-        "4/4. Введи ключевые слова или фразы через запятую.\n"
-        "Например: ремонт, нужна смета, ищу мастера",
+        "4/4. Введи ключевые слова/фразы списком.\n"
+        "Можно по одному на строку или через запятую/точку с запятой.\n\n"
+        "Например:\nремонт\nнужна смета\nищу мастера",
         reply_markup=_watch_cancel_kb(),
     )
     await callback.answer()
@@ -3024,32 +3214,132 @@ async def watch_choose_template(callback: CallbackQuery, state: FSMContext):
 @router.message(AddKeywordWatch.waiting_keywords)
 @admin_only
 async def watch_finish_add(message: Message, state: FSMContext):
-    keywords = [x.strip() for x in (message.text or "").split(",") if x.strip()]
+    keywords = _split_list_input(message.text, lower=True)
     if not keywords:
         await message.answer("Нужно хотя бы одно ключевое слово.", reply_markup=_watch_cancel_kb())
         return
+    if len(keywords) > 100:
+        await message.answer("За один раз можно указать до 100 ключевых слов/фраз.", reply_markup=_watch_cancel_kb())
+        return
+
+    data = await state.get_data()
+    chat_refs = data.get("chat_refs") or []
+    pre_resolved = data.get("resolved_chats") or []
+    if pre_resolved:
+        preview = {"resolved": pre_resolved, "errors": []}
+    else:
+        try:
+            preview = await userbot.resolve_keyword_watch_chats(int(data["sender_id"]), chat_refs)
+        except Exception as e:
+            logger.warning("Не удалось проверить список чатов автопарсера: %s", e)
+            await message.answer(f"❌ Не удалось проверить чаты: {e}", reply_markup=_watch_menu_kb())
+            await state.clear()
+            return
+
+    valid = preview.get("resolved") or []
+    errors = preview.get("errors") or []
+    if not valid:
+        details = "\n".join(f"• {x['ref']}: {x['error']}" for x in errors[:10])
+        has_invite_error = any(
+            "ссылка-приглашение истекла" in str(x.get("error") or "").lower()
+            or "checkchatinviterequest" in str(x.get("error") or "").lower()
+            for x in errors
+        )
+        kb_rows = []
+        if has_invite_error:
+            kb_rows.append([InlineKeyboardButton(text="📋 Выбрать из доступных чатов", callback_data="watch_pick_dialogs_from_error")])
+        kb_rows.append([InlineKeyboardButton(text="⬅️ В автопарсер", callback_data="menu_watches")])
+        await state.update_data(keywords=keywords)
+        await state.set_state(AddKeywordWatch.waiting_chat)
+        await message.answer(
+            "❌ Ни один чат не удалось открыть выбранным аккаунтом." + (f"\n\n{details}" if details else "") +
+            ("\n\nЕсли это приватный чат со старой invite-ссылкой, выбери его из списка уже доступных чатов аккаунта." if has_invite_error else ""),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
+        )
+        return
+
+    await state.update_data(
+        keywords=keywords,
+        valid_chat_refs=[x["ref"] for x in valid],
+        # Сохраняем результат предпросмотра. На подтверждении не нужно снова
+        # дергать CheckChatInviteRequest для той же приватной invite-ссылки.
+        resolved_chats=[
+            {"ref": x["ref"], "chat_id": int(x["chat_id"]), "title": x["title"]}
+            for x in valid
+        ],
+    )
+    await state.set_state(AddKeywordWatch.confirming)
+
+    lines = [
+        "🔎 Проверь массовое добавление",
+        "",
+        f"Аккаунт: {data.get('sender_label', '#' + str(data['sender_id']))}",
+        f"Шаблон: {data.get('template_name', '#' + str(data['template_id']))}",
+        f"Чатов распознано: {len(valid)}",
+        f"Ключевых слов/фраз: {len(keywords)}",
+        "",
+        "Чаты:",
+    ]
+    lines.extend(f"• {x['title']}" for x in valid[:15])
+    if len(valid) > 15:
+        lines.append(f"… и ещё {len(valid) - 15}")
+    lines.extend(["", "Ключи: " + ", ".join(keywords[:20])])
+    if len(keywords) > 20:
+        lines.append(f"… и ещё {len(keywords) - 20}")
+    if errors:
+        lines.extend(["", f"⚠️ Не удалось распознать: {len(errors)}"] )
+        lines.extend(f"• {x['ref']}: {x['error']}" for x in errors[:8])
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"✅ Добавить {len(valid)}", callback_data="watch_bulk_confirm")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="menu_watches")],
+    ])
+    await message.answer("\n".join(lines)[:3900], reply_markup=kb)
+
+
+@router.callback_query(AddKeywordWatch.confirming, F.data == "watch_bulk_confirm")
+@admin_only
+async def watch_bulk_confirm(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     try:
-        watch = await userbot.add_keyword_watch(
-            int(data["sender_id"]), data["chat_ref"], keywords, int(data["template_id"])
+        result = await userbot.add_keyword_watches(
+            int(data["sender_id"]),
+            data.get("valid_chat_refs") or [],
+            data.get("keywords") or [],
+            int(data["template_id"]),
+            resolved_chats=data.get("resolved_chats") or None,
         )
     except Exception as e:
-        logger.warning("Не удалось добавить правило автопарсера: %s", e)
-        await message.answer(
-            f"❌ Не удалось добавить правило: {e}",
-            reply_markup=_watch_menu_kb(),
-        )
+        logger.warning("Не удалось массово добавить правила автопарсера: %s", e)
+        error_text = str(e)
+        low_error = error_text.lower()
+        if "checkchatinviterequest" in low_error and (
+            "expired" in low_error or "not valid" in low_error or "invalid" in low_error
+        ):
+            error_text = (
+                "Ссылка-приглашение истекла или недействительна. "
+                "Получите новую ссылку либо добавьте чат по @username/ID, если он доступен аккаунту."
+            )
+        await callback.message.edit_text(f"❌ Ошибка добавления: {error_text}", reply_markup=_watch_menu_kb())
         await state.clear()
+        await callback.answer()
         return
+
     await state.clear()
-    await message.answer(
-        f"✅ Правило #{watch['id']} добавлено.\n\n"
-        f"Чат: {watch['title']}\n"
-        f"Аккаунт: {data.get('sender_label', '#' + str(data['sender_id']))}\n"
-        f"Шаблон: {data.get('template_name', '#' + str(data['template_id']))}\n"
-        f"Ключи: {', '.join(watch['keywords'])}",
-        reply_markup=_watch_menu_kb(),
+    added = result.get("added") or []
+    skipped = result.get("skipped_existing") or []
+    errors = result.get("errors") or []
+    text = (
+        "✅ Правила обработаны\n\n"
+        f"Добавлено: {len(added)}\n"
+        f"Уже существовали: {len(skipped)}\n"
+        f"Ошибок: {len(errors)}\n\n"
+        f"Ключи: {', '.join(result.get('keywords') or [])}"
     )
+    if errors:
+        text += "\n\n⚠️ Ошибки:\n" + "\n".join(f"• {x['ref']}: {x['error']}" for x in errors[:10])
+    await callback.message.edit_text(text[:3900], reply_markup=_watch_menu_kb())
+    await callback.answer("Готово")
 
 
 async def _render_watch_list(callback: CallbackQuery):
@@ -3108,6 +3398,8 @@ def _keyword_hit_label(row: dict) -> str:
         "send_failed": "❌ ошибка",
         "candidate_no_consent": "🟡 найдено, без авто-DM",
         "skipped_already_contacted": "↩️ уже был в реестре",
+        "history_candidate": "📚 найдено в истории",
+        "history_already_contacted": "📚 история · уже был в реестре",
     }
     action = action_map.get(row.get("action"), row.get("action") or "—")
     when = (row.get("created_at") or "—")[:19]
@@ -3141,6 +3433,129 @@ async def watch_hits(callback: CallbackQuery, state: FSMContext):
         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows),
     )
     await callback.answer()
+
+
+@router.callback_query(F.data == "watch_history_start")
+@admin_only
+async def watch_history_start(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    watches = await db.get_monitored_chats(enabled_only=True)
+    if not watches:
+        await callback.message.edit_text(
+            "Нет активных правил. Сначала добавь хотя бы один чат.",
+            reply_markup=_watch_menu_kb(),
+        )
+        await callback.answer()
+        return
+    rows = [[InlineKeyboardButton(text="📚 Все активные правила", callback_data="whpick_0")]]
+    for row in watches[:30]:
+        title = row.get("chat_title") or row.get("chat_ref") or str(row.get("chat_id"))
+        rows.append([InlineKeyboardButton(text=f"#{row['id']} · {title[:34]}", callback_data=f"whpick_{row['id']}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="menu_watches")])
+    await callback.message.edit_text(
+        "📚 Сканирование истории\n\n"
+        "Выбери одно правило или все активные. Исторический скан только сохраняет совпадения "
+        "в журнал и никому автоматически не пишет.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("whpick_"))
+@admin_only
+async def watch_history_choose_scope(callback: CallbackQuery, state: FSMContext):
+    try:
+        target = int(callback.data.rsplit("_", 1)[-1])
+    except (TypeError, ValueError):
+        await callback.answer("Некорректное правило", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="100 сообщений", callback_data=f"whrun_{target}_n_100"),
+            InlineKeyboardButton(text="500 сообщений", callback_data=f"whrun_{target}_n_500"),
+        ],
+        [InlineKeyboardButton(text="1000 сообщений", callback_data=f"whrun_{target}_n_1000")],
+        [
+            InlineKeyboardButton(text="За 1 день", callback_data=f"whrun_{target}_d_1"),
+            InlineKeyboardButton(text="За 3 дня", callback_data=f"whrun_{target}_d_3"),
+            InlineKeyboardButton(text="За 7 дней", callback_data=f"whrun_{target}_d_7"),
+        ],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="watch_history_start")],
+    ])
+    await callback.message.edit_text(
+        "Выбери глубину истории. Для периода действует технический лимит до 10 000 сообщений на чат.\n\n"
+        "⚠️ Исторический режим только собирает совпадения — автоответы отключены.",
+        reply_markup=kb,
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("whrun_"))
+@admin_only
+async def watch_history_run(callback: CallbackQuery, state: FSMContext):
+    parts = callback.data.split("_")
+    if len(parts) != 4:
+        await callback.answer("Некорректные параметры", show_alert=True)
+        return
+    try:
+        target = int(parts[1])
+        value = int(parts[3])
+    except ValueError:
+        await callback.answer("Некорректные параметры", show_alert=True)
+        return
+    mode = parts[2]
+    if mode not in {"n", "d"}:
+        await callback.answer("Некорректный режим", show_alert=True)
+        return
+
+    watches = await db.get_monitored_chats(enabled_only=True)
+    if target:
+        watches = [w for w in watches if int(w["id"]) == target]
+    if not watches:
+        await callback.answer("Правило не найдено", show_alert=True)
+        return
+
+    await callback.answer("Сканирование запущено")
+    await callback.message.edit_text(
+        f"📚 Сканирую историю для {len(watches)} правил(а)…\n"
+        "Сообщения никому не отправляются. Совпадения добавляются в журнал."
+    )
+
+    totals = {"scanned": 0, "matched": 0, "added": 0, "errors": 0}
+    details = []
+    for watch in watches:
+        try:
+            result = await userbot.scan_keyword_watch_history(
+                int(watch["id"]),
+                limit=value if mode == "n" else None,
+                days=value if mode == "d" else None,
+            )
+            for key in totals:
+                totals[key] += int(result.get(key, 0) or 0)
+            details.append(
+                f"• {result.get('title')}: просмотрено {result.get('scanned', 0)}, "
+                f"совпадений {result.get('matched', 0)}, новых в журнале {result.get('added', 0)}"
+            )
+        except Exception as e:
+            totals["errors"] += 1
+            title = watch.get("chat_title") or watch.get("chat_ref") or f"#{watch['id']}"
+            error_text = str(e) if isinstance(e, ValueError) else f"{type(e).__name__}: {e}"
+            details.append(f"• {title}: ошибка — {error_text}")
+
+    text = (
+        "✅ Исторический скан завершён\n\n"
+        f"Просмотрено сообщений: {totals['scanned']}\n"
+        f"Совпадений по ключам: {totals['matched']}\n"
+        f"Новых записей в журнале: {totals['added']}\n"
+        f"Ошибок: {totals['errors']}\n\n"
+        + "\n".join(details[:25])
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🧾 Открыть совпадения", callback_data="watch_hits")],
+        [InlineKeyboardButton(text="📚 Сканировать ещё", callback_data="watch_history_start")],
+        [InlineKeyboardButton(text="⬅️ Автопарсер", callback_data="menu_watches")],
+    ])
+    await callback.message.edit_text(text[:3900], reply_markup=kb)
 
 
 # Старые команды оставлены как совместимый резервный способ управления.
